@@ -637,73 +637,226 @@ AGENT_DISPATCH = {
 }
 
 
+# ----------- Web取得 + Claude要約 -----------
+# requests + BeautifulSoup でHTML取得→本文抽出→Bedrockで要約
+# (JS必須サイトは AgentCore Browser SDK 経由に拡張可能。v1はシンプル版)
+_WEB_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X) WhisType/0.2",
+    "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+}
+
+
+def _fetch_page_text(url: str, max_chars: int = 8000) -> str:
+    import requests
+    from bs4 import BeautifulSoup
+    r = requests.get(url, headers=_WEB_FETCH_HEADERS, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.content, "html.parser")
+    # ノイズ要素を除去
+    for tag in soup(["script", "style", "noscript", "header", "footer",
+                     "nav", "aside", "form", "iframe"]):
+        tag.decompose()
+    # 本文っぽい要素を優先抽出
+    main = (soup.find("article") or soup.find("main") or soup.body or soup)
+    text = " ".join(main.get_text(separator=" ", strip=True).split())
+    return text[:max_chars]
+
+
+def _summarize_with_claude(content: str, question: str = None) -> str:
+    import boto3
+    client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+    if question:
+        prompt = (
+            f"以下のWebページ本文から、ユーザーの質問に簡潔に答えてください。"
+            f"答えのテキストのみを返し、前置きや出典説明は不要です。\n\n"
+            f"【質問】{question}\n\n【ページ本文】\n{content}"
+        )
+    else:
+        prompt = (
+            "以下のWebページ本文の要点を、日本語で3〜6行の箇条書きにまとめてください。"
+            "各行は「・」で始め、要約テキストのみを返してください。\n\n"
+            f"【ページ本文】\n{content}"
+        )
+    r = client.converse(
+        modelId=BEDROCK_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+    )
+    return r["output"]["message"]["content"][0]["text"].strip()
+
+
+def _action_web_fetch_and_summarize(url: str = None, query: str = None,
+                                    question: str = None) -> str:
+    """URLまたは検索クエリで取得→要約。質問があればそれに答える形で。"""
+    target_url = url
+    if not target_url and query:
+        # Google検索結果ページから1位リンクを抜く
+        import requests, urllib.parse
+        from bs4 import BeautifulSoup
+        search_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+        try:
+            r = requests.get(search_url, headers=_WEB_FETCH_HEADERS, timeout=10)
+            soup = BeautifulSoup(r.content, "html.parser")
+            # Google検索結果の最初のリンク取得(構造変化に弱いがv1としては可)
+            for a in soup.find_all("a"):
+                href = a.get("href", "")
+                if href.startswith("/url?q="):
+                    target_url = urllib.parse.unquote(href.split("/url?q=")[1].split("&")[0])
+                    break
+                if href.startswith("http") and "google.com" not in href:
+                    target_url = href
+                    break
+        except Exception as e:
+            return f"検索失敗: {e}"
+    if not target_url:
+        return "URLも検索クエリも特定できませんでした"
+    try:
+        text = _fetch_page_text(target_url)
+        if not text:
+            return f"本文取得失敗: {target_url}"
+        summary = _summarize_with_claude(text, question)
+        return summary
+    except Exception as e:
+        return f"取得・要約エラー({target_url}): {e}"
+
+
 class Agent:
-    """音声を解釈してアクション実行 or テキスト挿入を判定するエージェント。"""
+    """Strands Agents ベースのマルチステップ・エージェント。
+
+    1発話で複数のアクション(例: リマインダー＋カレンダー)を順に実行できる。
+    ツール呼び出しが0件の発話は通常のテキストとして扱う。
+    """
 
     def __init__(self):
-        self._client = None
-        self._tried = False
+        self._agent = None
+        self._actions_log = []  # 1回のprocessで発火したアクションのメッセージ集
+        self._web_result = None  # web_fetch_and_summarize の結果(挿入対象テキスト)
+
+    def _build_tools(self):
+        from strands import tool
+
+        actions = self._actions_log
+
+        @tool
+        def create_reminder(title: str, minutes_later: int = None) -> str:
+            """macOSリマインダーにタスクを追加する。
+
+            Args:
+                title: リマインダーのタイトル(必須)
+                minutes_later: 今から何分後に通知するか(任意。指定なければ通知時刻なし)
+            """
+            msg = _action_create_reminder(title, minutes_later)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def create_calendar_event(title: str, start_iso: str,
+                                  duration_minutes: int = 60) -> str:
+            """macOSカレンダーに予定を追加する。
+
+            Args:
+                title: 予定のタイトル
+                start_iso: 開始日時のISO 8601(ローカル時刻)。例: 2026-06-15T15:00:00
+                duration_minutes: 所要時間(分)。デフォルト60。
+            """
+            msg = _action_create_calendar_event(title, start_iso, duration_minutes)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def open_url_or_search(url: str = None, query: str = None) -> str:
+            """ブラウザでURLを開く、またはGoogle検索を実行する。
+
+            Args:
+                url: 開きたいURL(指定があればqueryより優先)
+                query: 検索クエリ(URLがない場合)
+            """
+            msg = _action_open_url_or_search(url, query)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def web_fetch_and_summarize(url: str = None, query: str = None,
+                                    question: str = None) -> str:
+            """Webページの内容を取得し、Claudeで要約または質問に答える。
+            「〇〇調べて」「〇〇について教えて」「〇〇要約して」等で使う。
+
+            Args:
+                url: 取得したいURL(直接指定する場合)
+                query: 検索クエリ(URLが分からない場合、Google検索1位を取得)
+                question: ページ内容から答えてほしい質問(任意。なければ要約)
+            """
+            result = _action_web_fetch_and_summarize(url, query, question)
+            # 要約結果は ユーザーへのテキスト挿入対象なので actions ではなく
+            # 「テキスト」として返したい。挿入したい本文を返却用変数に渡す。
+            self._web_result = result
+            return result
+
+        return [create_reminder, create_calendar_event,
+                open_url_or_search, web_fetch_and_summarize]
 
     def _ensure(self):
-        if self._tried:
+        if self._agent is not None:
             return
-        self._tried = True
         try:
-            import boto3
-            self._client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+            from strands import Agent as StrandsAgent
+            from strands.models import BedrockModel
+            from datetime import datetime
+            now = datetime.now()
+            system_prompt = (
+                "あなたは音声入力アシスタントです。ユーザー発話を分析し、"
+                "次の4操作の明確な依頼が含まれていればツールを順に呼び出す:\n"
+                " - リマインダー追加: create_reminder\n"
+                " - カレンダー予定作成: create_calendar_event\n"
+                " - URL/検索をブラウザで開く: open_url_or_search\n"
+                " - Web内容を要約 or 質問に回答(本文取得して回答):"
+                " web_fetch_and_summarize\n"
+                "    └「〇〇調べて」「〇〇について教えて」「〇〇要約して」「〇〇は?」等\n\n"
+                "1発話に複数の依頼があれば、必要なツールを全て順番に呼ぶ。"
+                "操作の依頼が全くない発話には、ツールを呼ばずに空応答を返す。"
+                "会話的な返答・要約・翻訳・絵文字は禁止。\n\n"
+                f"現在日時: {now.strftime('%Y-%m-%d %H:%M (%a)')}\n"
+                "曖昧な相対時刻(明日の朝→翌09:00、今夜→当日21:00 等)はこれを基準に解釈する。"
+            )
+            model = BedrockModel(
+                model_id=BEDROCK_MODEL_ID,
+                region_name=BEDROCK_REGION,
+                temperature=0.0,
+            )
+            self._agent = StrandsAgent(
+                model=model,
+                tools=self._build_tools(),
+                system_prompt=system_prompt,
+            )
         except Exception as e:
-            log(f"Agent初期化失敗: {e}")
+            log(f"Strands Agent初期化失敗: {e}")
+            self._agent = None
 
     def process(self, text: str) -> dict:
         """戻り値: {'kind': 'action', 'message': '...'} または {'kind': 'text', 'value': '...'}"""
         self._ensure()
-        if self._client is None:
+        if self._agent is None:
             return {"kind": "text", "value": text}
-        from datetime import datetime
-        now = datetime.now()
-        system_prompt = (
-            "あなたは音声入力ディスパッチャです。ユーザー発話に対して、"
-            "以下の3つの操作の明確な依頼があればツールを呼ぶ。なければツールを呼ばずに空応答にする:\n"
-            " - リマインダー追加(「思い出させて」「リマインドして」「忘れないように」等)\n"
-            " - カレンダー予定作成(「予定入れて」「カレンダーに追加」「スケジュール登録」等)\n"
-            " - URL/検索を開く(「開いて」「検索して」「Webで〇〇」等)\n\n"
-            "ツールを呼ばない場合の応答テキストは空文字または一切返答しないこと。"
-            "発話を会話と解釈して話しかけたり、要約・翻訳・整文・コメント・絵文字を返したりは禁止。\n\n"
-            f"現在日時: {now.strftime('%Y-%m-%d %H:%M (%a)')}\n"
-            "曖昧な相対時刻(明日の朝→翌09:00、今夜→当日21:00 等)はこの日時を基準に解釈する。"
-        )
         try:
             t0 = time.time()
-            r = self._client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{"text": system_prompt}],
-                messages=[{"role": "user", "content": [{"text": text}]}],
-                toolConfig={"tools": AGENT_TOOLS},
-                inferenceConfig={"maxTokens": 1000, "temperature": 0.0},
-            )
-            content = r["output"]["message"]["content"]
-            log(f"Agent {time.time()-t0:.1f}s stop={r.get('stopReason')}")
-            messages = []
-            for block in content:
-                if "toolUse" in block:
-                    tu = block["toolUse"]
-                    name = tu["name"]
-                    args = tu.get("input", {})
-                    fn = AGENT_DISPATCH.get(name)
-                    if fn:
-                        try:
-                            msg = fn(**args)
-                            messages.append(msg)
-                            log(f"  → {name}({args}) = {msg}")
-                        except Exception as e:
-                            messages.append(f"{name}実行エラー: {e}")
-            if messages:
-                return {"kind": "action", "message": " / ".join(messages)}
-            # ツール呼び出しがなければ、元の音声認識テキストをそのまま挿入
-            # （LLMが返したテキストは捨てる。会話的応答や説明を混入させないため）
+            self._actions_log.clear()
+            self._web_result = None
+            result = self._agent(text)
+            elapsed = time.time() - t0
+            actions = list(self._actions_log)
+            web_result = self._web_result
+            log(f"Strands Agent {elapsed:.1f}s actions={len(actions)} web={bool(web_result)}")
+            # Web取得・要約が走った場合 → 要約結果をテキストとして挿入
+            if web_result:
+                return {"kind": "text", "value": web_result}
+            if actions:
+                for a in actions:
+                    log(f"  → {a}")
+                return {"kind": "action", "message": " / ".join(actions)}
+            # ツール未発火 → 元の音声認識テキストをそのまま挿入
             return {"kind": "text", "value": text}
         except Exception as e:
-            log(f"Agentエラー: {e}")
+            log(f"Strands Agentエラー: {e}")
             return {"kind": "text", "value": text}
 
 

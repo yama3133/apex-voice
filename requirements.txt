@@ -6,3 +6,7 @@ pyobjc-framework-Cocoa
 boto3
 botocore[crt]
 pynput
+strands-agents
+bedrock-agentcore
+requests
+beautifulsoup4
