@@ -1,83 +1,110 @@
 # WhisType
 
-macOSメニューバーに常駐する **音声タイピングツール**。マイクに話すと、その内容をローカルWhisperで文字に起こし、**いま開いているアプリのカーソル位置にそのまま入力**します（Slack・メモ・ブラウザなど何でも）。
+macOSメニューバーに常駐する **音声タイピング＋AIエージェント**。マイクに話すと、ローカルWhisperで文字に起こし、整文・敬語化・翻訳までこなして、**いま開いているアプリのカーソル位置に挿入**します。さらにエージェントモードでは音声から**リマインダー追加・カレンダー予定作成・Web検索**といったアクションも実行可能。
 
-- **完全ローカル / オフライン**（モデルDL後はネット不要）
-- **無料**・クラウドAPI不使用
-- 認識: [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon最適化, `whisper-large-v3-turbo`)
-- メニューバーから 左クリックで録音ON/OFF、右クリックで設定メニュー
-- 8秒無音で自動停止（停止し忘れ防止）
+- **音声認識**: ローカルWhisper (`mlx-whisper`, `whisper-large-v3-turbo`)
+- **AI後処理**: Amazon Bedrock Claude Haiku 4.5 で整文・敬語・英訳・箇条書き
+- **AIエージェント**: 音声 → ツール判定 → macOS連携アクション実行
+- **語彙学習**: Amazon Bedrock AgentCore Memory に固有名詞・専門用語を蓄積し、Whisperにヒント注入
+- **グローバルホットキー**: ⌃⌥V でどこからでも録音トグル
+- 多言語対応（11言語をメニューから切替）
 
 ## 動作環境
-- **Apple Silicon Mac**（M1以降）。Intel Macは `mlx` 非対応のため不可。
+- **Apple Silicon Mac**（M1以降）。Intel Macは `mlx` 非対応のため不可
 - macOS（マイク必須）
-- 初回のみネット接続（Whisperモデル約1.5GBを自動DL。以降はオフライン）
+- 初回のみネット接続（Whisperモデル約1.5GBを自動DL。以降はオフライン動作）
+- 後処理・エージェント・Memory機能はAWS認証必要（`aws login`）
 
-## インストール（ソースから動かす）
+## クイックスタート
 
+### 1. ソースから動かす
 ```bash
 git clone https://github.com/yama3133/whistype.git
 cd whistype
-
-# Python 3.12 推奨（Homebrew）
 /opt/homebrew/bin/python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-
-# 起動
 .venv/bin/python voicetype.py
 ```
 
-## 権限（初回だけ必要）
-1. **マイク**: 初回録音時にダイアログ → 「許可」。
-2. **アクセシビリティ**: 他アプリへ貼り付け（Cmd+V送出）に必須。
-   - システム設定 → プライバシーとセキュリティ → アクセシビリティ
-   - 起動元（開発実行なら「ターミナル」、`.app`版なら「WhisType」）を **ON**
-   - 許可がないと挿入されず、アプリが設定画面を自動で開きます。
+### 2. ビルド済み `.app` を使う
+[Releases](https://github.com/yama3133/whistype/releases) から `WhisType.app.zip` をダウンロード → 展開 → **右クリック → 開く**（未署名のため初回のみ）。
 
-## 使い方
-1. メニューバーの 🎤 を **左クリック** → 録音開始（🔴）
-2. テキスト欄にカーソルを置いて話す → 区切り（無音0.8秒）ごとに挿入
-3. もう一度 🔴 を **左クリック** → 録音停止
-4. **右クリック**でメニュー（感度調整・終了）
-5. 録音ONのまま8秒無音が続くと自動停止
+## 権限（初回だけ必要）
+1. **マイク** — 初回録音時に許可
+2. **アクセシビリティ** — 他アプリへ貼り付け（Cmd+V送出）に必須。設定 → プライバシーとセキュリティ → アクセシビリティ で `WhisType`(または `ターミナル`) を ON
+3. **入力監視** — グローバルホットキー（⌃⌥V）に必要。初回押下時にダイアログ → 許可
+4. **AWS認証** — 後処理・エージェント・Memory機能を使う場合のみ。`aws login` で更新
+
+## メニュー
+
+メニューバー 🎤 を **左クリック** でメニューが開きます。
+
+| 項目 | 内容 |
+|---|---|
+| 🎤 録音開始 / ■ 録音停止 | クリックで録音トグル（ホットキー ⌃⌥V でも可） |
+| 状態 | 録音中 / 停止中 |
+| 言語 | 11言語切替（自動判定/日本語/English/中文/한국어/Español/Français/Deutsch/Italiano/Português/Русский） |
+| 後処理 | 生 / 整文 / 敬語化 / 英訳 / 箇条書き / **エージェント実行** |
+| ホットキー | 現在のキー組合せ表示・変更 |
+| 感度を上げる/下げる | VAD閾値の調整 |
+| 終了 | アプリ終了 |
+
+選んだ設定は `~/.whistype/config.json` に保存され、次回起動時に復元されます。
+
+## 後処理モード
+
+| モード | 動作 | 外部アクション |
+|---|---|---|
+| 生 | Whisper結果そのまま挿入 | なし |
+| 整文 | フィラー除去・同音異義誤り補正・自然な書き言葉化 | なし |
+| 敬語化 | ビジネス敬語に書き換え | なし |
+| 英訳 | 自然な英語に翻訳 | なし |
+| 箇条書き | 要点を箇条書きに | なし |
+| **エージェント** | 発話内容を判定し、適切なツール実行 or テキスト挿入 | **あり** |
+
+エージェントモードのみ外部アクションを伴います。普段は「生」または「整文」を選んでおけば、意図せず予定が作られたりブラウザが開くことはありません。
+
+### エージェントが実行できるアクション
+- **リマインダー追加**: 「30分後にメール送るのを思い出させて」
+- **カレンダー予定作成**: 「明日の3時に田中さんと打ち合わせをカレンダーに入れて」
+- **URL/検索を開く**: 「PythonのドキュメントをWebで検索して」
+
+## 語彙メモリ（AgentCore Memory）
+
+認識した整文済みテキストから固有名詞・専門用語を抽出し、ローカル（`~/.whistype/vocabulary.json`）＋クラウド（AgentCore Memory）に蓄積。次回以降の認識時に Whisper の `initial_prompt` として注入し、同音異義の誤認識を減らします。
+
+使うほど自分専用辞書が育つ仕組み。
 
 ## 設定（環境変数）
 | 変数 | 既定 | 説明 |
 |---|---|---|
 | `VOICETYPE_MODEL` | `mlx-community/whisper-large-v3-turbo` | 認識モデル |
 | `VOICETYPE_LANG` | `ja` | 認識言語（空文字で自動判定） |
-| `VOICETYPE_PROMPT` | (空) | 用語ヒント。専門用語を入れると誤変換減 |
-| `VOICETYPE_SENSITIVITY` | `2.5` | 小さいほど拾いやすい／大きいほど鈍感 |
+| `VOICETYPE_PROMPT` | (空) | 追加の用語ヒント |
+| `VOICETYPE_SENSITIVITY` | `2.5` | VAD閾値（小さいほど拾いやすい） |
 | `VOICETYPE_MIC` | (空=OS既定) | 使用マイク（index番号または名前の一部） |
-| `VOICETYPE_DEBUG` | (空) | `1`でRMS音量ログを表示 |
+| `VOICETYPE_DEBUG` | (空) | `1`でRMS音量ログ表示 |
+| `WHISTYPE_BEDROCK_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 後処理・エージェント用モデル |
+| `WHISTYPE_BEDROCK_REGION` | `us-east-1` | Bedrockリージョン |
+| `WHISTYPE_MEMORY_ID` | (既定値あり) | AgentCore Memory ストアID |
+| `WHISTYPE_ACTOR_ID` | `default-user` | Memory上のユーザー識別子 |
 
-例（外付けマイク + 専門用語ヒント）:
-```bash
-VOICETYPE_MIC="THRONMAX" VOICETYPE_PROMPT="Bedrock。AgentCore。mlx。" .venv/bin/python voicetype.py
-```
-
-## `.app` ビルド（配布用）
-
+## `.app` ビルド
 ```bash
 .venv/bin/python setup.py py2app
 # → dist/WhisType.app
 ```
-
-- メニューバー常駐（LSUIElement、Dockに出ない）。マイク権限説明 (`NSMicrophoneUsageDescription`) 同梱。
-- 未署名のため初回は **右クリック → 開く**。以降は通常起動。
-- バンドルサイズは約875MB（mlx本体・numpy・PyObjC同梱のため）。
+未署名のため配布先では **初回だけ右クリック→開く**。サイズは約900MB（mlx・numpy・boto3・PyObjC同梱）。
 
 ## 仕組み
 ```
-マイク → 簡易VAD（音量ベース） → 発話区間を切り出し
-  → mlx-whisper（文字起こし）
-  → NSPasteboard（クリップボード退避→貼付→復元） → Cmd+V送出 → カーソル位置に挿入
+マイク → 簡易VAD → 発話区間
+  → mlx-whisper (initial_prompt: 学習語彙)
+  → 後処理(Bedrock Claude Haiku 4.5)
+    ├─ 生/整文/敬語/英訳/箇条書き → テキスト挿入
+    └─ エージェント → Tool判定 → リマインダー/カレンダー/URL実行 or 挿入
+  → AgentCore Memory に書き込み(語彙蓄積)
 ```
-
-## 既知の制約
-- Whisperは音響だけで認識するため、**五十音の羅列**や固有名詞は誤変換が増えます（普通の文章は実用的）。
-- 録音ON中に無言が続くと幻聴が出ることがあるため、8秒で自動停止しています。
-- 完璧な整文・フィラー除去がほしい場合は後段にLLM（ローカルmlx or Amazon Bedrock）を足す拡張余地があります。
 
 ## ライセンス
 MIT

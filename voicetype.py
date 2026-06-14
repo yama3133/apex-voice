@@ -55,6 +55,52 @@ LANGUAGES = [
 # 設定の永続化（メニューバーで選んだ言語等を保存）
 CONFIG_PATH = Path.home() / ".whistype" / "config.json"
 
+# 後処理モード (label, mode_key, prompt)
+# 'raw'はLLMを呼ばずそのまま返す。それ以外はBedrock Claude Haiku 4.5に投げる。
+POSTPROCESS_MODES = [
+    ("生（そのまま）", "raw", None),
+    ("整文（フィラー除去・誤認識補正）", "polish",
+     "次は音声認識の結果テキストです。以下のルールで整えてください:\n"
+     "1. フィラー(えーと、あの、その等)や言い淀みを取り除く\n"
+     "2. 音声認識特有の同音異義の誤り(例: 聖典→晴天、機構→気候、慣性→歓声 等)を文脈から判断して修正\n"
+     "3. 自然な書き言葉にする(意味や情報は変えない、内容は追加しない)\n"
+     "4. ユーザーが意図的に繰り返している語句は省略せず保持する\n"
+     "5. 同じ言語のまま、整形結果のテキストのみを返す。前置きや説明は不要"),
+    ("敬語化", "formal",
+     "次のテキストを、ビジネスで使える丁寧な敬語に書き換えてください。意味は変えず、"
+     "同じ言語で整形結果のテキストのみを返してください。前置きや説明は不要です。"),
+    ("英訳", "english",
+     "次のテキストを、フィラー(えーと、あの、um, uh等)を取り除き、"
+     "自然で読みやすい英語に翻訳してください。"
+     "翻訳結果のテキストのみを返してください。前置きや説明は不要です。"),
+    ("箇条書きに要約", "bullets",
+     "次のテキストの要点を短い箇条書き(各行の先頭に「・」)にまとめてください。"
+     "元の言語で出力し、箇条書きのみを返してください。前置きや説明は不要です。"),
+    ("エージェント実行（リマインダー・カレンダー・検索）", "agent", None),
+]
+
+# Bedrockモデル(後処理用)。アカウント761018866498/us-east-1で疎通確認済み
+BEDROCK_MODEL_ID = os.environ.get(
+    "WHISTYPE_BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+BEDROCK_REGION = os.environ.get("WHISTYPE_BEDROCK_REGION", "us-east-1")
+
+# AgentCore Memory: ユーザー語彙の永続化先
+AGENTCORE_MEMORY_ID = os.environ.get(
+    "WHISTYPE_MEMORY_ID", "whistype_personal_vocabulary-YrdZy493pf"
+)
+AGENTCORE_ACTOR_ID = os.environ.get("WHISTYPE_ACTOR_ID", "default-user")
+
+# ローカル語彙ファイル
+VOCAB_PATH = Path.home() / ".whistype" / "vocabulary.json"
+# initial_prompt に注入する上位語の最大数
+VOCAB_TOP_N = 30
+
+# グローバルホットキー（pynput形式の文字列）。configで上書き可。
+# 例: "<ctrl>+<alt>+v" / "<cmd>+<shift>+<space>" / "<f5>"
+# OFFにしたい場合は空文字 "" を指定。
+DEFAULT_HOTKEY = "<ctrl>+<alt>+v"
+
 
 def load_config():
     try:
@@ -195,13 +241,481 @@ class Inserter:
 
 
 # ============================================================
+# 語彙メモリ（AgentCore Memory + ローカルキャッシュ）
+# ============================================================
+import re
+
+# 抽出対象: 2文字以上の連続漢字、または2文字以上の連続カタカナ、または3文字以上の英数
+_VOCAB_RE = re.compile(
+    r"[一-鿿]{2,}|"          # 連続漢字
+    r"[゠-ヿ]{2,}|"          # 連続カタカナ
+    r"[A-Za-z][A-Za-z0-9]{2,}"  # 英数(先頭は英字、3文字以上)
+)
+# 抽出から除外する一般語(ノイズ)
+_VOCAB_STOPWORDS = {
+    "これ", "それ", "あれ", "今日", "明日", "昨日", "本日", "昨年", "今年",
+    "今月", "来月", "今週", "来週", "毎日", "毎週", "毎月",
+    "場合", "時間", "問題", "対応", "確認", "状態", "状況", "内容",
+    "皆様", "私達", "自分", "相手", "誰か", "何か",
+}
+
+
+class MemoryManager:
+    """ユーザー語彙(固有名詞・専門用語・表記嗜好)を蓄積し、Whisperにヒントとして注入する。
+
+    - ローカル: ~/.whistype/vocabulary.json に語の頻度を保存(即座に効く)
+    - クラウド: AgentCore Memory に event を非同期書き込み(他端末同期・永続化)
+    """
+
+    def __init__(self):
+        self.vocab = {}                      # term -> freq
+        self.session_id = f"whistype-{int(time.time())}"
+        self._client = None
+        self._client_tried = False
+        self._lock = threading.Lock()
+        self._load_local()
+
+    def _load_local(self):
+        try:
+            if VOCAB_PATH.exists():
+                self.vocab = json.loads(VOCAB_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            log(f"語彙ロード失敗: {e}")
+            self.vocab = {}
+
+    def _save_local(self):
+        try:
+            VOCAB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            VOCAB_PATH.write_text(
+                json.dumps(self.vocab, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log(f"語彙保存失敗: {e}")
+
+    def _ensure_client(self):
+        if self._client_tried:
+            return
+        self._client_tried = True
+        if not AGENTCORE_MEMORY_ID:
+            return
+        try:
+            import boto3
+            self._client = boto3.client("bedrock-agentcore", region_name=BEDROCK_REGION)
+        except Exception as e:
+            log(f"AgentCore Memoryクライアント初期化失敗: {e}")
+            self._client = None
+
+    def _extract_terms(self, text: str):
+        terms = []
+        for m in _VOCAB_RE.findall(text):
+            if m in _VOCAB_STOPWORDS:
+                continue
+            if len(m) < 2:
+                continue
+            terms.append(m)
+        return terms
+
+    def record(self, raw_text: str, polished_text: str = None):
+        """認識結果を語彙に反映。整文済みテキストがあればそれを優先。
+        AgentCoreへのevent書き込みは別スレッドで非同期に実行する。"""
+        target = (polished_text or raw_text or "").strip()
+        if not target:
+            return
+        with self._lock:
+            for term in self._extract_terms(target):
+                self.vocab[term] = self.vocab.get(term, 0) + 1
+            self._save_local()
+        threading.Thread(
+            target=self._write_event_to_cloud,
+            args=(raw_text or "", polished_text or raw_text or ""),
+            daemon=True,
+        ).start()
+
+    def _write_event_to_cloud(self, raw_text: str, polished_text: str):
+        self._ensure_client()
+        if self._client is None:
+            return
+        try:
+            # 会話形式のイベント(ユーザー発話=raw, アシスタント出力=polished)
+            payload = [
+                {"conversational": {"role": "USER",
+                                    "content": {"text": raw_text or "(空)"}}},
+                {"conversational": {"role": "ASSISTANT",
+                                    "content": {"text": polished_text or "(空)"}}},
+            ]
+            from datetime import datetime
+            self._client.create_event(
+                memoryId=AGENTCORE_MEMORY_ID,
+                actorId=AGENTCORE_ACTOR_ID,
+                sessionId=self.session_id,
+                eventTimestamp=datetime.utcnow(),
+                payload=payload,
+            )
+        except Exception as e:
+            log(f"AgentCore event書き込み失敗: {e}")
+
+    def get_initial_prompt(self) -> str:
+        """Whisperに渡す initial_prompt: 上位N語の固有名詞・専門用語を列挙。
+        句読点ヒント付きの定型文も先頭に置いて句読点が付きやすくする。"""
+        with self._lock:
+            top = sorted(self.vocab.items(), key=lambda x: -x[1])[:VOCAB_TOP_N]
+        if not top:
+            return ""
+        terms = "、".join(t for t, _ in top)
+        return f"用語: {terms}。"
+
+    def sync_from_cloud(self):
+        """起動時にクラウドから過去event取得し、ローカル語彙を再構築。
+        全session横断で最近のイベントを取得。"""
+        self._ensure_client()
+        if self._client is None:
+            return
+        try:
+            # 過去session一覧(最新20件)
+            sr = self._client.list_sessions(
+                memoryId=AGENTCORE_MEMORY_ID,
+                actorId=AGENTCORE_ACTOR_ID,
+                maxResults=20,
+            )
+            count = 0
+            for s in sr.get("sessionSummaries", []):
+                sid = s.get("sessionId")
+                if not sid or sid == self.session_id:
+                    continue
+                try:
+                    er = self._client.list_events(
+                        memoryId=AGENTCORE_MEMORY_ID,
+                        actorId=AGENTCORE_ACTOR_ID,
+                        sessionId=sid,
+                        maxResults=50,
+                    )
+                except Exception:
+                    continue
+                for ev in er.get("events", []):
+                    for blk in ev.get("payload", []):
+                        conv = blk.get("conversational")
+                        if conv and conv.get("role") == "ASSISTANT":
+                            txt = conv.get("content", {}).get("text", "")
+                            for term in self._extract_terms(txt):
+                                self.vocab[term] = self.vocab.get(term, 0) + 1
+                                count += 1
+            if count:
+                self._save_local()
+                log(f"クラウドから語彙{count}件取り込み(全session)")
+        except Exception as e:
+            log(f"AgentCore同期失敗: {e}")
+
+
+# ============================================================
+# グローバルホットキー（録音トグル）
+# ============================================================
+class HotkeyManager:
+    """pynputで指定のキー組み合わせを監視し、押されたらコールバックを呼ぶ。"""
+
+    def __init__(self, hotkey: str, callback):
+        self.hotkey = hotkey
+        self.callback = callback
+        self._listener = None
+        self._thread = None
+
+    def start(self):
+        if not self.hotkey:
+            log("ホットキー: 未設定（無効）")
+            return
+        try:
+            from pynput import keyboard
+            def _on_activate():
+                try:
+                    self.callback()
+                except Exception as e:
+                    log(f"ホットキー処理エラー: {e}")
+            self._listener = keyboard.GlobalHotKeys({self.hotkey: _on_activate})
+            self._listener.daemon = True
+            self._listener.start()
+            log(f"ホットキー登録: {self.hotkey}")
+        except Exception as e:
+            log(f"ホットキー登録失敗: {e}")
+            self._listener = None
+
+    def stop(self):
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+    def update(self, new_hotkey: str):
+        self.stop()
+        self.hotkey = new_hotkey
+        self.start()
+
+
+# ============================================================
+# 後処理（LLMで整文・敬語化・翻訳など）
+# ============================================================
+class Postprocessor:
+    """Bedrock Claude Haiku 4.5に整文プロンプトを投げる。失敗時は生テキストを返す。"""
+
+    def __init__(self):
+        self._client = None       # 遅延初期化
+        self._tried_init = False
+
+    def _ensure(self):
+        if self._tried_init:
+            return
+        self._tried_init = True
+        try:
+            import boto3
+            self._client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        except Exception as e:
+            log(f"Bedrockクライアント初期化失敗: {e}")
+            self._client = None
+
+    def apply(self, text: str, mode: str) -> str:
+        if not text or mode == "raw":
+            return text
+        prompt_template = None
+        for _, key, p in POSTPROCESS_MODES:
+            if key == mode:
+                prompt_template = p
+                break
+        if not prompt_template:
+            return text
+        self._ensure()
+        if self._client is None:
+            return text  # クライアント未初期化なら何もせず通す
+        try:
+            t0 = time.time()
+            r = self._client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                messages=[{"role": "user",
+                           "content": [{"text": f"{prompt_template}\n\n{text}"}]}],
+                inferenceConfig={"maxTokens": 1000, "temperature": 0.3},
+            )
+            out = r["output"]["message"]["content"][0]["text"].strip()
+            log(f"後処理({mode}) {time.time()-t0:.1f}s: {out[:50]}")
+            return out
+        except Exception as e:
+            log(f"後処理エラー({mode}): {e}")
+            return text
+
+
+# ============================================================
+# エージェント（音声→アクション実行 / macOS連携）
+# ============================================================
+AGENT_TOOLS = [
+    {
+        "toolSpec": {
+            "name": "create_reminder",
+            "description": "macOSのリマインダーアプリにリマインダーを作成する。"
+                           "「あとで〇〇する」「〇〇するのを忘れないように」など、"
+                           "時刻や時間後の通知を伴うタスクを記録する。",
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "リマインダーのタイトル"},
+                    "minutes_later": {
+                        "type": "integer",
+                        "description": "今から何分後に通知するか（指定がなければ省略）",
+                    },
+                },
+                "required": ["title"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "create_calendar_event",
+            "description": "macOSのカレンダーに予定を追加する。"
+                           "日時と予定タイトルが含まれる発話で使う。",
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "予定のタイトル"},
+                    "start_iso": {
+                        "type": "string",
+                        "description": "開始日時(ISO 8601、ローカル時刻)。例: '2026-06-15T15:00:00'",
+                    },
+                    "duration_minutes": {
+                        "type": "integer",
+                        "description": "所要時間(分)。指定がなければ60。",
+                    },
+                },
+                "required": ["title", "start_iso"],
+            }},
+        }
+    },
+    {
+        "toolSpec": {
+            "name": "open_url_or_search",
+            "description": "URLを開く、またはWeb検索を実行する。"
+                           "「〇〇のドキュメントを開いて」「〇〇を検索して」等で使う。",
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "開きたいURL。指定があればqueryより優先。",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "検索クエリ(URLが無い場合)。Google検索で開く。",
+                    },
+                },
+            }},
+        }
+    },
+]
+
+
+def _osascript(script: str) -> tuple[int, str]:
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return r.returncode, (r.stdout or r.stderr).strip()
+
+
+def _action_create_reminder(title: str, minutes_later: int = None) -> str:
+    if minutes_later:
+        script = (
+            f'tell application "Reminders" to make new reminder with properties '
+            f'{{name:"{title}", remind me date:(current date) + {int(minutes_later)} * minutes}}'
+        )
+    else:
+        script = (
+            f'tell application "Reminders" to make new reminder with properties '
+            f'{{name:"{title}"}}'
+        )
+    code, out = _osascript(script)
+    if code == 0:
+        when = f"{minutes_later}分後" if minutes_later else "(時刻指定なし)"
+        return f"リマインダー追加: 「{title}」{when}"
+    return f"リマインダー追加失敗: {out}"
+
+
+def _action_create_calendar_event(title: str, start_iso: str,
+                                  duration_minutes: int = 60) -> str:
+    # ISO 8601 → AppleScriptの date 形式は環境依存なので、年月日時分秒を分解して組み立てる
+    from datetime import datetime, timedelta
+    try:
+        start = datetime.fromisoformat(start_iso)
+    except Exception as e:
+        return f"日時解釈失敗({start_iso}): {e}"
+    end = start + timedelta(minutes=int(duration_minutes or 60))
+    fmt = lambda d: f'date "{d.strftime("%Y/%m/%d %H:%M:%S")}"'
+    script = (
+        'tell application "Calendar"\n'
+        '  set targetCal to first calendar whose writable is true\n'
+        '  tell targetCal\n'
+        f'    make new event with properties {{summary:"{title}", '
+        f'start date:{fmt(start)}, end date:{fmt(end)}}}\n'
+        '  end tell\n'
+        'end tell'
+    )
+    code, out = _osascript(script)
+    if code == 0:
+        return f"予定追加: 「{title}」{start.strftime('%m/%d %H:%M')}〜"
+    return f"予定追加失敗: {out}"
+
+
+def _action_open_url_or_search(url: str = None, query: str = None) -> str:
+    import urllib.parse
+    if url:
+        subprocess.run(["open", url])
+        return f"URLを開く: {url}"
+    if query:
+        target = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+        subprocess.run(["open", target])
+        return f"Google検索: {query}"
+    return "URLもqueryも指定されていません"
+
+
+AGENT_DISPATCH = {
+    "create_reminder": _action_create_reminder,
+    "create_calendar_event": _action_create_calendar_event,
+    "open_url_or_search": _action_open_url_or_search,
+}
+
+
+class Agent:
+    """音声を解釈してアクション実行 or テキスト挿入を判定するエージェント。"""
+
+    def __init__(self):
+        self._client = None
+        self._tried = False
+
+    def _ensure(self):
+        if self._tried:
+            return
+        self._tried = True
+        try:
+            import boto3
+            self._client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+        except Exception as e:
+            log(f"Agent初期化失敗: {e}")
+
+    def process(self, text: str) -> dict:
+        """戻り値: {'kind': 'action', 'message': '...'} または {'kind': 'text', 'value': '...'}"""
+        self._ensure()
+        if self._client is None:
+            return {"kind": "text", "value": text}
+        from datetime import datetime
+        now = datetime.now()
+        system_prompt = (
+            "あなたは音声入力ディスパッチャです。ユーザー発話に対して、"
+            "以下の3つの操作の明確な依頼があればツールを呼ぶ。なければツールを呼ばずに空応答にする:\n"
+            " - リマインダー追加(「思い出させて」「リマインドして」「忘れないように」等)\n"
+            " - カレンダー予定作成(「予定入れて」「カレンダーに追加」「スケジュール登録」等)\n"
+            " - URL/検索を開く(「開いて」「検索して」「Webで〇〇」等)\n\n"
+            "ツールを呼ばない場合の応答テキストは空文字または一切返答しないこと。"
+            "発話を会話と解釈して話しかけたり、要約・翻訳・整文・コメント・絵文字を返したりは禁止。\n\n"
+            f"現在日時: {now.strftime('%Y-%m-%d %H:%M (%a)')}\n"
+            "曖昧な相対時刻(明日の朝→翌09:00、今夜→当日21:00 等)はこの日時を基準に解釈する。"
+        )
+        try:
+            t0 = time.time()
+            r = self._client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{"text": system_prompt}],
+                messages=[{"role": "user", "content": [{"text": text}]}],
+                toolConfig={"tools": AGENT_TOOLS},
+                inferenceConfig={"maxTokens": 1000, "temperature": 0.0},
+            )
+            content = r["output"]["message"]["content"]
+            log(f"Agent {time.time()-t0:.1f}s stop={r.get('stopReason')}")
+            messages = []
+            for block in content:
+                if "toolUse" in block:
+                    tu = block["toolUse"]
+                    name = tu["name"]
+                    args = tu.get("input", {})
+                    fn = AGENT_DISPATCH.get(name)
+                    if fn:
+                        try:
+                            msg = fn(**args)
+                            messages.append(msg)
+                            log(f"  → {name}({args}) = {msg}")
+                        except Exception as e:
+                            messages.append(f"{name}実行エラー: {e}")
+            if messages:
+                return {"kind": "action", "message": " / ".join(messages)}
+            # ツール呼び出しがなければ、元の音声認識テキストをそのまま挿入
+            # （LLMが返したテキストは捨てる。会話的応答や説明を混入させないため）
+            return {"kind": "text", "value": text}
+        except Exception as e:
+            log(f"Agentエラー: {e}")
+            return {"kind": "text", "value": text}
+
+
+# ============================================================
 # 文字起こし（mlx-whisper）
 # ============================================================
 class Transcriber:
-    def __init__(self, model=MODEL, language=LANGUAGE, prompt=PROMPT):
+    def __init__(self, model=MODEL, language=LANGUAGE, prompt=PROMPT, memory=None):
         self.model = model
         self.language = language
         self.prompt = prompt
+        self.memory = memory  # MemoryManager(任意)。語彙ヒント自動付与
         self._mlx = None  # 遅延import（起動を速く）
 
     def _ensure(self):
@@ -223,8 +737,16 @@ class Transcriber:
         )
         if self.language:
             kwargs["language"] = self.language
+        # ユーザー定義プロンプト + 学習語彙ヒントを結合してinitial_promptに
+        prompt_parts = []
         if self.prompt:
-            kwargs["initial_prompt"] = self.prompt
+            prompt_parts.append(self.prompt)
+        if self.memory is not None:
+            mp = self.memory.get_initial_prompt()
+            if mp:
+                prompt_parts.append(mp)
+        if prompt_parts:
+            kwargs["initial_prompt"] = " ".join(prompt_parts)
         result = self._mlx.transcribe(audio, **kwargs)
         return (result.get("text") or "").strip()
 
@@ -377,7 +899,18 @@ class WhisTypeApp(rumps.App):
         if "VOICETYPE_LANG" not in os.environ and "language" in self.config:
             initial_lang = self.config["language"]
 
-        self.transcriber = Transcriber(language=initial_lang)
+        # 後処理モードもconfigから復元
+        self.postprocess_mode = self.config.get("postprocess", "raw")
+        if not any(k == self.postprocess_mode for _, k, _ in POSTPROCESS_MODES):
+            self.postprocess_mode = "raw"
+
+        # 語彙メモリ(AgentCore Memory + ローカルキャッシュ)
+        self.memory = MemoryManager()
+        threading.Thread(target=self.memory.sync_from_cloud, daemon=True).start()
+
+        self.transcriber = Transcriber(language=initial_lang, memory=self.memory)
+        self.postprocessor = Postprocessor()
+        self.agent = Agent()
         self.inserter = Inserter()
         self.recorder = Recorder(on_segment=self._enqueue)
         self.jobs = queue.Queue()
@@ -396,11 +929,30 @@ class WhisTypeApp(rumps.App):
             self.lang_items[code] = item
             lang_menu.add(item)
 
+        # 後処理サブメニュー
+        self.pp_items = {}
+        pp_menu = rumps.MenuItem(self._pp_menu_title(self.postprocess_mode))
+        self.item_pp_menu = pp_menu
+        for label, key, _ in POSTPROCESS_MODES:
+            item = rumps.MenuItem(label, callback=self._make_pp_callback(key))
+            if key == self.postprocess_mode:
+                item.state = 1
+            self.pp_items[key] = item
+            pp_menu.add(item)
+
+        # ホットキー表示メニュー（クリックで変更ダイアログ）
+        self.item_hotkey = rumps.MenuItem(
+            self._hotkey_label(self.config.get("hotkey", DEFAULT_HOTKEY)),
+            callback=self.change_hotkey,
+        )
+
         self.menu = [
             self.item_toggle,
             self.item_status,
             None,
             lang_menu,
+            pp_menu,
+            self.item_hotkey,
             None,
             rumps.MenuItem("感度を上げる (拾いやすく)", callback=self.sens_up),
             rumps.MenuItem("感度を下げる (拾いにくく)", callback=self.sens_down),
@@ -411,6 +963,11 @@ class WhisTypeApp(rumps.App):
         # 録音とワーカーを開始（録音は停止状態でスタート。メニューの「録音開始」で開始する）
         self.recorder.start()
         threading.Thread(target=self._worker, daemon=True).start()
+
+        # グローバルホットキー
+        self.hotkey = self.config.get("hotkey", DEFAULT_HOTKEY)
+        self.hotkey_mgr = HotkeyManager(self.hotkey, lambda: self.toggle(None))
+        self.hotkey_mgr.start()
 
     # ---- 自動停止のUI同期 ----
     @rumps.timer(1)
@@ -458,6 +1015,63 @@ class WhisTypeApp(rumps.App):
             log(f"言語切替: {self._lang_label(code)} ({code or 'auto'})")
         return cb
 
+    def _pp_label(self, key):
+        for label, k, _ in POSTPROCESS_MODES:
+            if k == key:
+                return label
+        return key
+
+    def _pp_menu_title(self, key):
+        # 長いラベルは縮めて表示
+        short = self._pp_label(key).split("（")[0]
+        return f"後処理: {short}"
+
+    def _hotkey_label(self, hotkey: str) -> str:
+        # pynput形式("<ctrl>+<alt>+v")を見やすい表示に変換
+        if not hotkey:
+            return "ホットキー: 無効"
+        nice = (hotkey.replace("<cmd>", "⌘").replace("<ctrl>", "⌃")
+                      .replace("<alt>", "⌥").replace("<shift>", "⇧")
+                      .replace("<space>", "Space").replace("+", "")
+                      .replace("<", "").replace(">", "").upper())
+        return f"ホットキー: {nice}"
+
+    def change_hotkey(self, _):
+        win = rumps.Window(
+            message=(
+                "pynput形式で入力。例:\n"
+                "  <ctrl>+<alt>+v  (⌃⌥V)\n"
+                "  <cmd>+<shift>+<space>  (⌘⇧Space)\n"
+                "  <f5>\n"
+                "空欄でホットキー無効化"
+            ),
+            title="ホットキーを変更",
+            default_text=self.config.get("hotkey", DEFAULT_HOTKEY),
+            ok="変更",
+            cancel="キャンセル",
+        )
+        res = win.run()
+        if not res.clicked:
+            return
+        new_key = (res.text or "").strip()
+        self.hotkey = new_key
+        self.config["hotkey"] = new_key
+        save_config(self.config)
+        self.hotkey_mgr.update(new_key)
+        self.item_hotkey.title = self._hotkey_label(new_key)
+        rumps.notification("WhisType", "ホットキー", self._hotkey_label(new_key))
+
+    def _make_pp_callback(self, key):
+        def cb(_):
+            for k, item in self.pp_items.items():
+                item.state = 1 if k == key else 0
+            self.postprocess_mode = key
+            self.item_pp_menu.title = self._pp_menu_title(key)
+            self.config["postprocess"] = key
+            save_config(self.config)
+            log(f"後処理切替: {self._pp_label(key)}")
+        return cb
+
     def sens_up(self, _):
         global SENSITIVITY
         SENSITIVITY = max(1.2, SENSITIVITY - 0.3)
@@ -469,6 +1083,10 @@ class WhisTypeApp(rumps.App):
         rumps.notification("WhisType", "感度", f"感度: {SENSITIVITY:.1f}（大きいほど拾いにくい）")
 
     def quit_app(self, _):
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:
+            pass
         self.recorder.stop()
         rumps.quit_application()
 
@@ -486,7 +1104,33 @@ class WhisTypeApp(rumps.App):
                     log(f"幻聴として破棄: {text[:30]}")
                 elif text:
                     log(f"認識: {text}")
-                    self.inserter.insert(text, on_perm_error=self._warn_accessibility)
+                    raw_text = text
+                    final_text = text
+                    if self.postprocess_mode == "agent":
+                        result = self.agent.process(text)
+                        if result["kind"] == "action":
+                            rumps.notification(
+                                "WhisType", "アクション実行", result["message"]
+                            )
+                            # アクション時は語彙学習しない
+                            final_text = None
+                        else:
+                            final_text = result["value"]
+                            self.inserter.insert(
+                                final_text,
+                                on_perm_error=self._warn_accessibility,
+                            )
+                    else:
+                        if self.postprocess_mode != "raw":
+                            final_text = self.postprocessor.apply(
+                                text, self.postprocess_mode
+                            )
+                        self.inserter.insert(
+                            final_text, on_perm_error=self._warn_accessibility
+                        )
+                    # 挿入したテキストを語彙学習へ
+                    if final_text:
+                        self.memory.record(raw_text, final_text)
             except Exception as e:
                 log(f"認識エラー: {e}")
             finally:

@@ -3,3 +3,6 @@ sounddevice
 numpy
 rumps
 pyobjc-framework-Cocoa
+boto3
+botocore[crt]
+pynput
