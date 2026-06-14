@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VoiceType - macOS 常駐の音声タイピングツール
+WhisType - macOS 常駐の音声タイピングツール
 
 仕組み:
   メニューバーのマイクで録音ON → 音量(RMS)ベースの簡易VADで発話区間を切り出し
@@ -14,26 +14,18 @@ VoiceType - macOS 常駐の音声タイピングツール
 
 import os
 import sys
+import json
 import time
 import zlib
 import queue
 import threading
 import subprocess
+from pathlib import Path
 
-import objc
 import numpy as np
 import sounddevice as sd
 import rumps
-from Foundation import NSObject
-from AppKit import (
-    NSApp as _AKNSApp,
-    NSEventMaskLeftMouseUp,
-    NSEventMaskRightMouseUp,
-    NSEventTypeRightMouseUp,
-    NSEventModifierFlagControl,
-    NSPasteboard,
-    NSPasteboardTypeString,
-)
+from AppKit import NSPasteboard, NSPasteboardTypeString
 
 # ============================================================
 # 設定（環境変数で上書き可）
@@ -41,7 +33,42 @@ from AppKit import (
 # 認識モデル（HuggingFace上のmlx-community形式）。初回起動時に自動DLされる。
 MODEL = os.environ.get("VOICETYPE_MODEL", "mlx-community/whisper-large-v3-turbo")
 # 認識言語（自動判定にしたい場合は空文字 "" にする）
+# 環境変数が指定されていればそれを優先。空ならconfigファイルから読み込む。
 LANGUAGE = os.environ.get("VOICETYPE_LANG", "ja")
+
+# 言語選択用のメニュー定義（表示名, Whisperコード）
+# Whisperは100言語に対応。よく使う言語を主菜単に並べ、その他はサブメニューにできる。
+LANGUAGES = [
+    ("自動判定", ""),
+    ("日本語", "ja"),
+    ("English", "en"),
+    ("中文", "zh"),
+    ("한국어", "ko"),
+    ("Español", "es"),
+    ("Français", "fr"),
+    ("Deutsch", "de"),
+    ("Italiano", "it"),
+    ("Português", "pt"),
+    ("Русский", "ru"),
+]
+
+# 設定の永続化（メニューバーで選んだ言語等を保存）
+CONFIG_PATH = Path.home() / ".whistype" / "config.json"
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"設定保存に失敗: {e}")
 # 用語ヒント(initial_prompt)。既定は空（定型句の幻聴を招くため入れない）。
 # 専門用語の誤変換が気になる時だけ "Bedrock。AgentCore。mlx。" のように設定する。
 PROMPT = os.environ.get("VOICETYPE_PROMPT", "")
@@ -332,19 +359,6 @@ class Recorder:
             self.on_segment(audio)
 
 
-class _IconClickTarget(NSObject):
-    """メニューバーアイコンの直接クリックを受けるハンドラ（PyObjC）。"""
-    def initWithApp_(self, app):
-        self = objc.super(_IconClickTarget, self).init()
-        if self is None:
-            return None
-        self._app = app
-        return self
-
-    def onClick_(self, sender):
-        self._app.on_icon_click()
-
-
 # ============================================================
 # メニューバー常駐アプリ
 # ============================================================
@@ -353,19 +367,40 @@ ICON_REC = "🔴"      # 録音中（クリックで停止）
 ICON_WORK = "✍️"     # 認識処理中
 
 
-class VoiceTypeApp(rumps.App):
+class WhisTypeApp(rumps.App):
     def __init__(self):
         super().__init__(ICON_IDLE, quit_button=None)
-        self.transcriber = Transcriber()
+
+        # 設定読み込み: configファイルに保存された言語があれば反映（環境変数指定がない場合のみ）
+        self.config = load_config()
+        initial_lang = LANGUAGE
+        if "VOICETYPE_LANG" not in os.environ and "language" in self.config:
+            initial_lang = self.config["language"]
+
+        self.transcriber = Transcriber(language=initial_lang)
         self.inserter = Inserter()
         self.recorder = Recorder(on_segment=self._enqueue)
         self.jobs = queue.Queue()
 
         self.item_toggle = rumps.MenuItem("🎤 録音開始", callback=self.toggle)
         self.item_status = rumps.MenuItem("状態: 停止中", callback=None)
+
+        # 言語サブメニュー
+        self.lang_items = {}                  # code -> MenuItem
+        lang_menu = rumps.MenuItem(self._lang_menu_title(initial_lang))
+        self.item_lang_menu = lang_menu
+        for label, code in LANGUAGES:
+            item = rumps.MenuItem(label, callback=self._make_lang_callback(code))
+            if code == initial_lang:
+                item.state = 1                # チェックマーク
+            self.lang_items[code] = item
+            lang_menu.add(item)
+
         self.menu = [
             self.item_toggle,
             self.item_status,
+            None,
+            lang_menu,
             None,
             rumps.MenuItem("感度を上げる (拾いやすく)", callback=self.sens_up),
             rumps.MenuItem("感度を下げる (拾いにくく)", callback=self.sens_down),
@@ -373,10 +408,7 @@ class VoiceTypeApp(rumps.App):
             rumps.MenuItem("終了", callback=self.quit_app),
         ]
 
-        self._icon_hacked = False
-        self._click_target = None
-
-        # 録音とワーカーを開始（録音は停止状態でスタート。アイコンのクリックで開始する）
+        # 録音とワーカーを開始（録音は停止状態でスタート。メニューの「録音開始」で開始する）
         self.recorder.start()
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -387,44 +419,6 @@ class VoiceTypeApp(rumps.App):
             self.title = ICON_IDLE
             self.item_toggle.title = "🎤 録音開始"
             self.item_status.title = "状態: 停止中(自動)"
-
-    # ---- アイコン直接クリック（左=録音トグル / 右or⌃=メニュー）----
-    @rumps.timer(0.5)
-    def _ensure_icon_click(self, _):
-        if not self._icon_hacked:
-            self._setup_icon_click()
-
-    def _setup_icon_click(self):
-        try:
-            item = self._nsapp.nsstatusitem
-            button = item.button()
-            if button is None:
-                return
-            self._click_target = _IconClickTarget.alloc().initWithApp_(self)
-            button.setTarget_(self._click_target)
-            button.setAction_("onClick:")
-            button.sendActionOn_(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)
-            item.setMenu_(None)
-            self._icon_hacked = True
-            log("アイコンの直接クリックを有効化（左=録音 / 右=メニュー）")
-        except Exception as e:
-            log(f"アイコンクリック設定に失敗: {e}")
-
-    def on_icon_click(self):
-        event = _AKNSApp().currentEvent()
-        is_right = False
-        try:
-            is_right = (event.type() == NSEventTypeRightMouseUp) or \
-                       bool(event.modifierFlags() & NSEventModifierFlagControl)
-        except Exception:
-            pass
-        if is_right:
-            item = self._nsapp.nsstatusitem
-            item.setMenu_(self._menu)
-            item.button().performClick_(None)
-            item.setMenu_(None)
-        else:
-            self.toggle(None)
 
     # ---- メニュー操作 ----
     def toggle(self, _):
@@ -444,15 +438,35 @@ class VoiceTypeApp(rumps.App):
             self.item_status.title = "状態: 停止中"
             log("録音停止")
 
+    def _lang_label(self, code):
+        for label, c in LANGUAGES:
+            if c == code:
+                return label
+        return code or "自動判定"
+
+    def _lang_menu_title(self, code):
+        return f"言語: {self._lang_label(code)}"
+
+    def _make_lang_callback(self, code):
+        def cb(_):
+            for c, item in self.lang_items.items():
+                item.state = 1 if c == code else 0
+            self.transcriber.language = code
+            self.item_lang_menu.title = self._lang_menu_title(code)
+            self.config["language"] = code
+            save_config(self.config)
+            log(f"言語切替: {self._lang_label(code)} ({code or 'auto'})")
+        return cb
+
     def sens_up(self, _):
         global SENSITIVITY
         SENSITIVITY = max(1.2, SENSITIVITY - 0.3)
-        rumps.notification("VoiceType", "感度", f"感度: {SENSITIVITY:.1f}（小さいほど拾いやすい）")
+        rumps.notification("WhisType", "感度", f"感度: {SENSITIVITY:.1f}（小さいほど拾いやすい）")
 
     def sens_down(self, _):
         global SENSITIVITY
         SENSITIVITY = min(6.0, SENSITIVITY + 0.3)
-        rumps.notification("VoiceType", "感度", f"感度: {SENSITIVITY:.1f}（大きいほど拾いにくい）")
+        rumps.notification("WhisType", "感度", f"感度: {SENSITIVITY:.1f}（大きいほど拾いにくい）")
 
     def quit_app(self, _):
         self.recorder.stop()
@@ -480,7 +494,7 @@ class VoiceTypeApp(rumps.App):
 
     def _warn_accessibility(self):
         rumps.notification(
-            "VoiceType", "アクセシビリティ許可が必要",
+            "WhisType", "アクセシビリティ許可が必要",
             "システム設定 > プライバシーとセキュリティ > アクセシビリティ で許可してください",
         )
         subprocess.run([
@@ -490,4 +504,4 @@ class VoiceTypeApp(rumps.App):
 
 
 if __name__ == "__main__":
-    VoiceTypeApp().run()
+    WhisTypeApp().run()
