@@ -1,0 +1,5 @@
+mlx-whisper
+sounddevice
+numpy
+rumps
+pyobjc-framework-Cocoa

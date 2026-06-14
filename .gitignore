@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# py2app build artifacts
+build/
+dist/
+
+# テスト/ローカル生成物
+test.aiff
+test.raw
+test_result.log
+build.log
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
