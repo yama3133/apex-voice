@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WhisType - macOS 常駐の音声タイピングツール
+Apex Voice - macOS 常駐の音声タイピング & AIエージェント
 
 仕組み:
   メニューバーのマイクで録音ON → 音量(RMS)ベースの簡易VADで発話区間を切り出し
@@ -53,7 +53,9 @@ LANGUAGES = [
 ]
 
 # 設定の永続化（メニューバーで選んだ言語等を保存）
-CONFIG_PATH = Path.home() / ".whistype" / "config.json"
+CONFIG_PATH = Path.home() / ".apexvoice" / "config.json"
+# 旧名 ~/.whistype/ からの自動移行用
+_LEGACY_CONFIG_DIR = Path.home() / ".whistype"
 
 # 後処理モード (label, mode_key, prompt)
 # 'raw'はLLMを呼ばずそのまま返す。それ以外はBedrock Claude Haiku 4.5に投げる。
@@ -81,18 +83,29 @@ POSTPROCESS_MODES = [
 
 # Bedrockモデル(後処理用)。アカウント761018866498/us-east-1で疎通確認済み
 BEDROCK_MODEL_ID = os.environ.get(
-    "WHISTYPE_BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    "APEXVOICE_BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
-BEDROCK_REGION = os.environ.get("WHISTYPE_BEDROCK_REGION", "us-east-1")
+BEDROCK_REGION = os.environ.get("APEXVOICE_BEDROCK_REGION", "us-east-1")
 
 # AgentCore Memory: ユーザー語彙の永続化先
 AGENTCORE_MEMORY_ID = os.environ.get(
-    "WHISTYPE_MEMORY_ID", "whistype_personal_vocabulary-YrdZy493pf"
+    "APEXVOICE_MEMORY_ID", "whistype_personal_vocabulary-YrdZy493pf"
 )
-AGENTCORE_ACTOR_ID = os.environ.get("WHISTYPE_ACTOR_ID", "default-user")
+AGENTCORE_ACTOR_ID = os.environ.get("APEXVOICE_ACTOR_ID", "default-user")
 
 # ローカル語彙ファイル
-VOCAB_PATH = Path.home() / ".whistype" / "vocabulary.json"
+VOCAB_PATH = Path.home() / ".apexvoice" / "vocabulary.json"
+
+# 旧名 ~/.whistype/ にデータがあれば ~/.apexvoice/ に1回だけ自動移行
+def _migrate_legacy_config():
+    if _LEGACY_CONFIG_DIR.exists() and not CONFIG_PATH.parent.exists():
+        try:
+            import shutil
+            shutil.copytree(_LEGACY_CONFIG_DIR, CONFIG_PATH.parent)
+            print(f"[apex-voice] 旧設定 {_LEGACY_CONFIG_DIR} を {CONFIG_PATH.parent} に移行")
+        except Exception as e:
+            print(f"[apex-voice] 設定移行失敗: {e}")
+_migrate_legacy_config()
 # initial_prompt に注入する上位語の最大数
 VOCAB_TOP_N = 30
 
@@ -263,13 +276,13 @@ _VOCAB_STOPWORDS = {
 class MemoryManager:
     """ユーザー語彙(固有名詞・専門用語・表記嗜好)を蓄積し、Whisperにヒントとして注入する。
 
-    - ローカル: ~/.whistype/vocabulary.json に語の頻度を保存(即座に効く)
+    - ローカル: ~/.apexvoice/vocabulary.json に語の頻度を保存(即座に効く)
     - クラウド: AgentCore Memory に event を非同期書き込み(他端末同期・永続化)
     """
 
     def __init__(self):
         self.vocab = {}                      # term -> freq
-        self.session_id = f"whistype-{int(time.time())}"
+        self.session_id = f"apexvoice-{int(time.time())}"
         self._client = None
         self._client_tried = False
         self._lock = threading.Lock()
@@ -641,7 +654,7 @@ AGENT_DISPATCH = {
 # requests + BeautifulSoup でHTML取得→本文抽出→Bedrockで要約
 # (JS必須サイトは AgentCore Browser SDK 経由に拡張可能。v1はシンプル版)
 _WEB_FETCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X) WhisType/0.2",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X) ApexVoice/0.2",
     "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
 }
 
@@ -1042,7 +1055,7 @@ ICON_REC = "🔴"      # 録音中（クリックで停止）
 ICON_WORK = "✍️"     # 認識処理中
 
 
-class WhisTypeApp(rumps.App):
+class ApexVoiceApp(rumps.App):
     def __init__(self):
         super().__init__(ICON_IDLE, quit_button=None)
 
@@ -1212,7 +1225,7 @@ class WhisTypeApp(rumps.App):
         save_config(self.config)
         self.hotkey_mgr.update(new_key)
         self.item_hotkey.title = self._hotkey_label(new_key)
-        rumps.notification("WhisType", "ホットキー", self._hotkey_label(new_key))
+        rumps.notification("Apex Voice", "ホットキー", self._hotkey_label(new_key))
 
     def _make_pp_callback(self, key):
         def cb(_):
@@ -1228,12 +1241,12 @@ class WhisTypeApp(rumps.App):
     def sens_up(self, _):
         global SENSITIVITY
         SENSITIVITY = max(1.2, SENSITIVITY - 0.3)
-        rumps.notification("WhisType", "感度", f"感度: {SENSITIVITY:.1f}（小さいほど拾いやすい）")
+        rumps.notification("Apex Voice", "感度", f"感度: {SENSITIVITY:.1f}（小さいほど拾いやすい）")
 
     def sens_down(self, _):
         global SENSITIVITY
         SENSITIVITY = min(6.0, SENSITIVITY + 0.3)
-        rumps.notification("WhisType", "感度", f"感度: {SENSITIVITY:.1f}（大きいほど拾いにくい）")
+        rumps.notification("Apex Voice", "感度", f"感度: {SENSITIVITY:.1f}（大きいほど拾いにくい）")
 
     def quit_app(self, _):
         try:
@@ -1263,7 +1276,7 @@ class WhisTypeApp(rumps.App):
                         result = self.agent.process(text)
                         if result["kind"] == "action":
                             rumps.notification(
-                                "WhisType", "アクション実行", result["message"]
+                                "Apex Voice", "アクション実行", result["message"]
                             )
                             # アクション時は語彙学習しない
                             final_text = None
@@ -1291,7 +1304,7 @@ class WhisTypeApp(rumps.App):
 
     def _warn_accessibility(self):
         rumps.notification(
-            "WhisType", "アクセシビリティ許可が必要",
+            "Apex Voice", "アクセシビリティ許可が必要",
             "システム設定 > プライバシーとセキュリティ > アクセシビリティ で許可してください",
         )
         subprocess.run([
@@ -1301,4 +1314,4 @@ class WhisTypeApp(rumps.App):
 
 
 if __name__ == "__main__":
-    WhisTypeApp().run()
+    ApexVoiceApp().run()

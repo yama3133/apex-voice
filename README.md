@@ -1,11 +1,13 @@
-# WhisType
+# Apex Voice
 
-macOSメニューバーに常駐する **音声タイピング＋AIエージェント**。マイクに話すと、ローカルWhisperで文字に起こし、整文・敬語化・翻訳までこなして、**いま開いているアプリのカーソル位置に挿入**します。さらにエージェントモードでは音声から**リマインダー追加・カレンダー予定作成・Web検索**といったアクションも実行可能。
+macOSメニューバーに常駐する **音声タイピング＋AIエージェント**。マイクに話すと、ローカルWhisperで文字に起こし、整文・敬語化・翻訳までこなして、**いま開いているアプリのカーソル位置に挿入**します。さらにエージェントモードでは音声から**リマインダー追加・カレンダー予定作成・Web検索・Webページ要約**といったアクションも実行可能。
 
 - **音声認識**: ローカルWhisper (`mlx-whisper`, `whisper-large-v3-turbo`)
 - **AI後処理**: Amazon Bedrock Claude Haiku 4.5 で整文・敬語・英訳・箇条書き
-- **AIエージェント**: 音声 → ツール判定 → macOS連携アクション実行
-- **語彙学習**: Amazon Bedrock AgentCore Memory に固有名詞・専門用語を蓄積し、Whisperにヒント注入
+- **AIエージェント**: Strands Agents によるマルチステップ実行
+  - macOS連携: リマインダー / カレンダー / URLオープン
+  - Web取得 + 要約 (1発話で複数ツール順次実行)
+- **語彙学習**: Amazon Bedrock AgentCore Memory に固有名詞・専門用語を蓄積し、Whisperに自動ヒント注入
 - **グローバルホットキー**: ⌃⌥V でどこからでも録音トグル
 - 多言語対応（11言語をメニューから切替）
 
@@ -19,21 +21,21 @@ macOSメニューバーに常駐する **音声タイピング＋AIエージェ�
 
 ### 1. ソースから動かす
 ```bash
-git clone https://github.com/yama3133/whistype.git
-cd whistype
+git clone https://github.com/yama3133/apex-voice.git
+cd apex-voice
 /opt/homebrew/bin/python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python voicetype.py
 ```
 
 ### 2. ビルド済み `.app` を使う
-[Releases](https://github.com/yama3133/whistype/releases) から `WhisType.app.zip` をダウンロード → 展開 → **右クリック → 開く**（未署名のため初回のみ）。
+[Releases](https://github.com/yama3133/apex-voice/releases) から `ApexVoice.app.zip` をダウンロード → 展開 → **右クリック → 開く**（未署名のため初回のみ）。
 
 ## 権限（初回だけ必要）
 1. **マイク** — 初回録音時に許可
-2. **アクセシビリティ** — 他アプリへ貼り付け（Cmd+V送出）に必須。設定 → プライバシーとセキュリティ → アクセシビリティ で `WhisType`(または `ターミナル`) を ON
-3. **入力監視** — グローバルホットキー（⌃⌥V）に必要。初回押下時にダイアログ → 許可
-4. **AWS認証** — 後処理・エージェント・Memory機能を使う場合のみ。`aws login` で更新
+2. **アクセシビリティ** — 他アプリへ貼り付け（Cmd+V送出）に必須
+3. **入力監視** — グローバルホットキー（⌃⌥V）に必要
+4. **AWS認証** — 後処理・エージェント・Memory機能を使う場合（`aws login`）
 
 ## メニュー
 
@@ -49,7 +51,7 @@ cd whistype
 | 感度を上げる/下げる | VAD閾値の調整 |
 | 終了 | アプリ終了 |
 
-選んだ設定は `~/.whistype/config.json` に保存され、次回起動時に復元されます。
+選んだ設定は `~/.apexvoice/config.json` に保存され、次回起動時に復元されます。
 
 ## 後処理モード
 
@@ -64,14 +66,18 @@ cd whistype
 
 エージェントモードのみ外部アクションを伴います。普段は「生」または「整文」を選んでおけば、意図せず予定が作られたりブラウザが開くことはありません。
 
-### エージェントが実行できるアクション
-- **リマインダー追加**: 「30分後にメール送るのを思い出させて」
-- **カレンダー予定作成**: 「明日の3時に田中さんと打ち合わせをカレンダーに入れて」
-- **URL/検索を開く**: 「PythonのドキュメントをWebで検索して」
+### エージェントが実行できるアクション (Strands Agents)
+1発話で複数を順次実行可能。例えば「1分後にメール送るのを思い出させて、ついでに明日10時にミーティング予定追加して」と言えば2件同時に処理。
+
+- **リマインダー追加** — 「30分後にメール送るのを思い出させて」
+- **カレンダー予定作成** — 「明日の3時に田中さんと打ち合わせをカレンダーに入れて」
+- **URL/検索を開く** — 「PythonのドキュメントをWebで検索して」
+- **Web取得+要約** — 「Pythonの公式サイトから最新バージョン教えて」「Wikipediaで富士山について調べて」
+  - 内容を取得→Claude Haiku 4.5で要約→カーソル位置に挿入
 
 ## 語彙メモリ（AgentCore Memory）
 
-認識した整文済みテキストから固有名詞・専門用語を抽出し、ローカル（`~/.whistype/vocabulary.json`）＋クラウド（AgentCore Memory）に蓄積。次回以降の認識時に Whisper の `initial_prompt` として注入し、同音異義の誤認識を減らします。
+認識した整文済みテキストから固有名詞・専門用語を抽出し、ローカル（`~/.apexvoice/vocabulary.json`）＋クラウド（AgentCore Memory）に蓄積。次回以降の認識時に Whisper の `initial_prompt` として注入し、同音異義の誤認識を減らします。
 
 使うほど自分専用辞書が育つ仕組み。
 
@@ -84,15 +90,15 @@ cd whistype
 | `VOICETYPE_SENSITIVITY` | `2.5` | VAD閾値（小さいほど拾いやすい） |
 | `VOICETYPE_MIC` | (空=OS既定) | 使用マイク（index番号または名前の一部） |
 | `VOICETYPE_DEBUG` | (空) | `1`でRMS音量ログ表示 |
-| `WHISTYPE_BEDROCK_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 後処理・エージェント用モデル |
-| `WHISTYPE_BEDROCK_REGION` | `us-east-1` | Bedrockリージョン |
-| `WHISTYPE_MEMORY_ID` | (既定値あり) | AgentCore Memory ストアID |
-| `WHISTYPE_ACTOR_ID` | `default-user` | Memory上のユーザー識別子 |
+| `APEXVOICE_BEDROCK_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 後処理・エージェント用モデル |
+| `APEXVOICE_BEDROCK_REGION` | `us-east-1` | Bedrockリージョン |
+| `APEXVOICE_MEMORY_ID` | (既定値あり) | AgentCore Memory ストアID |
+| `APEXVOICE_ACTOR_ID` | `default-user` | Memory上のユーザー識別子 |
 
 ## `.app` ビルド
 ```bash
 .venv/bin/python setup.py py2app
-# → dist/WhisType.app
+# → dist/Apex Voice.app
 ```
 未署名のため配布先では **初回だけ右クリック→開く**。サイズは約900MB（mlx・numpy・boto3・PyObjC同梱）。
 
@@ -102,9 +108,15 @@ cd whistype
   → mlx-whisper (initial_prompt: 学習語彙)
   → 後処理(Bedrock Claude Haiku 4.5)
     ├─ 生/整文/敬語/英訳/箇条書き → テキスト挿入
-    └─ エージェント → Tool判定 → リマインダー/カレンダー/URL実行 or 挿入
+    └─ エージェント(Strands) → Tool判定
+        ├─ リマインダー/カレンダー/URL/Web要約 を順次実行
+        └─ テキスト挿入(ツール未発火時)
   → AgentCore Memory に書き込み(語彙蓄積)
 ```
+
+## バージョン履歴
+- **v0.2.0** — Apex Voice にリネーム。Strands Agents マルチステップ、Web取得+要約、AgentCore Memory、グローバルホットキー追加
+- **v0.1.0** — 初期リリース (WhisType として公開)
 
 ## ライセンス
 MIT

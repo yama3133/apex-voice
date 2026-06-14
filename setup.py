@@ -2,7 +2,7 @@
 """
 py2app ビルド設定。
   ビルド: .venv/bin/python setup.py py2app
-  生成物: dist/WhisType.app
+  生成物: dist/Apex Voice.app
 
 メニューバー常駐(LSUIElement)・マイク権限説明を含む。
 未署名のため配布先では初回「右クリック→開く」で起動する。
@@ -29,11 +29,11 @@ APP = ["voicetype.py"]
 OPTIONS = {
     "argv_emulation": False,
     "plist": {
-        "CFBundleName": "WhisType",
-        "CFBundleDisplayName": "WhisType",
-        "CFBundleIdentifier": "com.yamashita.whistype",
-        "CFBundleVersion": "0.1.0",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleName": "Apex Voice",
+        "CFBundleDisplayName": "Apex Voice",
+        "CFBundleIdentifier": "com.yamashita.apexvoice",
+        "CFBundleVersion": "0.2.0",
+        "CFBundleShortVersionString": "0.2.0",
         # Dockに出さずメニューバーのみに常駐
         "LSUIElement": True,
         # マイク利用の説明（初回ダイアログに表示）
@@ -46,7 +46,7 @@ OPTIONS = {
 
 setup(
     app=APP,
-    name="WhisType",
+    name="Apex Voice",
     options={"py2app": OPTIONS},
     setup_requires=["py2app"],
 )
