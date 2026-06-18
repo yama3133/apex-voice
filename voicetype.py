@@ -650,6 +650,326 @@ AGENT_DISPATCH = {
 }
 
 
+# ----------- 購入承認(Guardrails for AgentCore Payments) -----------
+# 音声 → エージェント判定 → ガードレール → ユーザー承認 → 実行(現状は検索URL)
+# 本格的なAgentCore Paymentsへの差し替え時は _execute_purchase をprocess_paymentに置換。
+PURCHASE_LOG_PATH = Path.home() / ".apexvoice" / "purchases.json"
+DEFAULT_GUARDRAILS = {
+    "max_amount_per_request": 5000,   # 1回あたり上限(円)
+    "max_total_per_day": 20000,       # 1日累計上限(円)
+    "require_approval": True,         # 承認ダイアログを出すか
+}
+
+
+def _load_purchase_log() -> list:
+    try:
+        if PURCHASE_LOG_PATH.exists():
+            return json.loads(PURCHASE_LOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def _save_purchase_log(entries: list):
+    try:
+        PURCHASE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PURCHASE_LOG_PATH.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log(f"購入ログ保存失敗: {e}")
+
+
+def _today_total_amount() -> int:
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    total = 0
+    for e in _load_purchase_log():
+        if e.get("date", "").startswith(today) and e.get("status") == "approved":
+            total += e.get("amount", 0)
+    return total
+
+
+def _show_approval_dialog(title: str, body: str, default: str = "拒否") -> bool:
+    """macOSネイティブの確認ダイアログ。承認ボタン押下時のみTrue。"""
+    # AppleScriptのダブルクオートを避けるためバックスラッシュエスケープ
+    safe_body = body.replace('"', '\\"').replace("\n", "\\n")
+    safe_title = title.replace('"', '\\"')
+    script = (
+        f'tell application "System Events" to display dialog "{safe_body}" '
+        f'with title "{safe_title}" '
+        f'buttons {{"拒否", "承認"}} default button "{default}" '
+        f'with icon caution'
+    )
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    return "承認" in (r.stdout or "")
+
+
+# ----------- 承認バックエンド: Aegis (Slack MCP) -----------
+# Aegisは stdio MCP サーバとして起動する。初回利用時にspawnし以後は再利用。
+# 既定で ~/aegis-slack-app/src/mcp-server.ts を npx tsx で起動。
+AEGIS_DEFAULT_DIR = str(Path.home() / "aegis-slack-app")
+
+
+class AegisApprovalClient:
+    """Aegis MCP(stdio)へ request_approval/wait_for_approval を発行するクライアント。
+    プロセスはAppex Voice起動中は常駐(初回利用時にspawn)。"""
+
+    def __init__(self):
+        self._client = None         # MCPセッション
+        self._proc = None           # 子プロセス
+        self._lock = threading.Lock()
+
+    def _ensure(self):
+        if self._client is not None:
+            return
+        try:
+            cfg = load_config()
+            aegis_dir = cfg.get("aegis_dir", AEGIS_DEFAULT_DIR)
+            if not (Path(aegis_dir) / "src" / "mcp-server.ts").exists():
+                raise RuntimeError(
+                    f"Aegis MCPサーバ({aegis_dir}/src/mcp-server.ts)が見つかりません"
+                )
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+            import anyio
+
+            # 同期APIに統一するため、asyncを別スレッドで動かす
+            self._anyio = anyio
+            self._ClientSession = ClientSession
+            self._stdio_client = stdio_client
+            self._server_params = StdioServerParameters(
+                command="npx",
+                args=["tsx", "src/mcp-server.ts"],
+                cwd=aegis_dir,
+            )
+            # セッション維持のためバックグラウンドループを起動
+            self._loop_thread = threading.Thread(
+                target=self._run_loop, daemon=True
+            )
+            self._loop_ready = threading.Event()
+            self._request_q = queue.Queue()
+            self._loop_thread.start()
+            ok = self._loop_ready.wait(timeout=20)
+            if not ok or self._client is None:
+                raise RuntimeError("Aegis MCPセッション開始がタイムアウト")
+        except Exception as e:
+            log(f"Aegis接続失敗: {e}")
+            self._client = None
+            raise
+
+    def _run_loop(self):
+        import anyio
+        anyio.run(self._async_main)
+
+    async def _async_main(self):
+        try:
+            async with self._stdio_client(self._server_params) as (read, write):
+                async with self._ClientSession(read, write) as session:
+                    await session.initialize()
+                    self._client = session
+                    self._loop_ready.set()
+                    log("Aegis MCPセッション開始")
+                    # キューから来たリクエストを順次処理
+                    while True:
+                        item = await anyio.to_thread.run_sync(
+                            self._request_q.get
+                        )
+                        if item is None:
+                            break
+                        future, kind, args = item
+                        try:
+                            result = await session.call_tool(kind, args)
+                            future.set(("ok", result))
+                        except Exception as e:
+                            future.set(("err", e))
+        except Exception as e:
+            log(f"Aegis _async_main エラー: {e}")
+            self._loop_ready.set()  # ブロック解除
+            self._client = None
+
+    def _call_sync(self, kind: str, args: dict, timeout: float = 70.0):
+        class _Future:
+            def __init__(self):
+                self._ev = threading.Event()
+                self._val = None
+            def set(self, v):
+                self._val = v
+                self._ev.set()
+            def get(self, t):
+                self._ev.wait(t)
+                return self._val
+        fut = _Future()
+        self._request_q.put((fut, kind, args))
+        v = fut.get(timeout)
+        if v is None:
+            raise TimeoutError(f"Aegis {kind} timed out")
+        status, payload = v
+        if status == "err":
+            raise payload
+        return payload
+
+    @staticmethod
+    def _extract_json(result) -> dict:
+        # MCP CallToolResult から JSON テキストを取り出す
+        for c in (result.content or []):
+            txt = getattr(c, "text", None)
+            if txt:
+                try:
+                    return json.loads(txt)
+                except Exception:
+                    return {"raw": txt}
+        return {}
+
+    def request_approval(self, item: str, max_price_yen: int,
+                         store: str, note: str = None) -> bool:
+        """Aegis経由で承認を求める。承認ボタン押下時のみTrue。"""
+        with self._lock:
+            self._ensure()
+        # 1) request_approval
+        req_args = {
+            "agent": "apex-voice",
+            "action": "purchase",
+            "args": {
+                "item": item,
+                "max_price_yen": max_price_yen,
+                "store": store or "amazon",
+                "note": note or "",
+            },
+            "risk": "high",
+            "reason": "音声起点の購入リクエスト",
+        }
+        r = self._call_sync("request_approval", req_args)
+        d = self._extract_json(r)
+        request_id = d.get("request_id")
+        if not request_id:
+            log(f"Aegis request_approval失敗: {d}")
+            return False
+        if d.get("status") == "approved" and d.get("auto_approved"):
+            return True
+        # 2) wait_for_approval (最大55秒×繰り返し、合計2分まで)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            try:
+                wr = self._call_sync(
+                    "wait_for_approval",
+                    {"request_id": request_id, "timeout_seconds": 50},
+                    timeout=70,
+                )
+                wd = self._extract_json(wr)
+                st = wd.get("status")
+                if st == "approved":
+                    return True
+                if st in ("denied", "expired"):
+                    return False
+                # info_requested / pending → 続けて待機
+            except Exception as e:
+                log(f"Aegis wait_for_approval エラー: {e}")
+                return False
+        log("Aegis 承認待ちタイムアウト(2分)")
+        return False
+
+
+# シングルトン
+_AEGIS_CLIENT = AegisApprovalClient()
+
+
+def _show_approval_via_slack(title: str, body: str,
+                              item: str, amount: int, store: str,
+                              note: str = None) -> bool:
+    try:
+        return _AEGIS_CLIENT.request_approval(item, amount, store, note)
+    except Exception as e:
+        log(f"Slack(Aegis)承認失敗 → ローカルダイアログにフォールバック: {e}")
+        return _show_approval_dialog(title, body)
+
+
+def _execute_purchase(item: str, max_price_yen: int, store: str) -> str:
+    """承認後の購入実行。デモではamazon検索を開くのみ。
+    本番AgentCore Paymentsならここで process_payment を呼ぶ。"""
+    import urllib.parse
+    store_lc = (store or "").lower()
+    if "rakuten" in store_lc or "楽天" in store_lc:
+        url = "https://search.rakuten.co.jp/search/mall/" + urllib.parse.quote(item)
+    elif "mercari" in store_lc or "メルカリ" in store_lc:
+        url = "https://jp.mercari.com/search?keyword=" + urllib.parse.quote(item)
+    else:
+        url = ("https://www.amazon.co.jp/s?k=" + urllib.parse.quote(item) +
+               f"&rh=p_36:-{max_price_yen}00")  # 上限フィルタ(amazonは銭単位)
+    subprocess.run(["open", url])
+    return url
+
+
+def _action_purchase_request(item: str, max_price_yen: int,
+                             store: str = None, note: str = None) -> str:
+    """音声起点の購入依頼: ガードレール → 承認 → 実行(検索URL表示)。"""
+    from datetime import datetime
+
+    # 設定読み込み(configファイル上書きあれば反映)
+    cfg = load_config()
+    grd = {**DEFAULT_GUARDRAILS, **cfg.get("guardrails", {})}
+
+    # --- Guardrail 1: 1回あたり上限 ---
+    if max_price_yen > grd["max_amount_per_request"]:
+        msg = (f"❌ ガードレール: 1回あたり上限超過 "
+               f"(¥{max_price_yen:,} > ¥{grd['max_amount_per_request']:,})")
+        _log_purchase(item, max_price_yen, store, "blocked_per_request_limit")
+        return msg
+
+    # --- Guardrail 2: 1日累計上限 ---
+    today_total = _today_total_amount()
+    if today_total + max_price_yen > grd["max_total_per_day"]:
+        msg = (f"❌ ガードレール: 本日累計上限超過 "
+               f"(¥{today_total:,} + ¥{max_price_yen:,} > ¥{grd['max_total_per_day']:,})")
+        _log_purchase(item, max_price_yen, store, "blocked_daily_limit")
+        return msg
+
+    # --- 承認ダイアログ ---
+    if grd["require_approval"]:
+        body = (f"商品: {item}\n"
+                f"上限価格: ¥{max_price_yen:,}\n"
+                f"店舗: {store or '指定なし'}\n"
+                f"本日累計: ¥{today_total:,} → ¥{today_total + max_price_yen:,}")
+        if note:
+            body += f"\nメモ: {note}"
+        backend = cfg.get("approval_backend", "local")
+        if backend == "slack":
+            approved = _show_approval_via_slack(
+                "購入リクエスト承認", body,
+                item, max_price_yen, store, note,
+            )
+        else:
+            approved = _show_approval_dialog("購入リクエスト承認", body)
+        if not approved:
+            _log_purchase(item, max_price_yen, store, "denied")
+            return f"🛑 ユーザーが拒否: {item}"
+
+    # --- 実行 ---
+    url = _execute_purchase(item, max_price_yen, store or "amazon")
+    _log_purchase(item, max_price_yen, store, "approved", url)
+    return f"✅ 承認・購入処理開始: {item} (上限¥{max_price_yen:,}) → {url}"
+
+
+def _log_purchase(item: str, amount: int, store: str, status: str, url: str = None):
+    from datetime import datetime
+    entries = _load_purchase_log()
+    entries.append({
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "item": item,
+        "amount": amount,
+        "store": store,
+        "status": status,
+        "url": url,
+    })
+    # 直近100件のみ保持
+    if len(entries) > 100:
+        entries = entries[-100:]
+    _save_purchase_log(entries)
+
+
 # ----------- Web取得 + Claude要約 -----------
 # requests + BeautifulSoup でHTML取得→本文抽出→Bedrockで要約
 # (JS必須サイトは AgentCore Browser SDK 経由に拡張可能。v1はシンプル版)
@@ -789,6 +1109,22 @@ class Agent:
             return msg
 
         @tool
+        def purchase_request(item: str, max_price_yen: int,
+                             store: str = None, note: str = None) -> str:
+            """購入リクエストを起こす(ガードレール+ユーザー承認必須)。
+            「Amazonで〇〇を1000円までで買って」「楽天で△△注文」等で使う。
+
+            Args:
+                item: 商品名(必須)
+                max_price_yen: 上限価格(円、必須)
+                store: 購入元(amazon/rakuten/mercari等、任意)
+                note: 補足メモ(任意)
+            """
+            msg = _action_purchase_request(item, max_price_yen, store, note)
+            actions.append(msg)
+            return msg
+
+        @tool
         def web_fetch_and_summarize(url: str = None, query: str = None,
                                     question: str = None) -> str:
             """Webページの内容を取得し、Claudeで要約または質問に答える。
@@ -806,7 +1142,8 @@ class Agent:
             return result
 
         return [create_reminder, create_calendar_event,
-                open_url_or_search, web_fetch_and_summarize]
+                open_url_or_search, web_fetch_and_summarize,
+                purchase_request]
 
     def _ensure(self):
         if self._agent is not None:
@@ -818,13 +1155,16 @@ class Agent:
             now = datetime.now()
             system_prompt = (
                 "あなたは音声入力アシスタントです。ユーザー発話を分析し、"
-                "次の4操作の明確な依頼が含まれていればツールを順に呼び出す:\n"
+                "次の5操作の明確な依頼が含まれていればツールを順に呼び出す:\n"
                 " - リマインダー追加: create_reminder\n"
                 " - カレンダー予定作成: create_calendar_event\n"
                 " - URL/検索をブラウザで開く: open_url_or_search\n"
-                " - Web内容を要約 or 質問に回答(本文取得して回答):"
-                " web_fetch_and_summarize\n"
-                "    └「〇〇調べて」「〇〇について教えて」「〇〇要約して」「〇〇は?」等\n\n"
+                " - Web内容を要約 or 質問に回答: web_fetch_and_summarize\n"
+                "    └「〇〇調べて」「〇〇について教えて」「〇〇要約して」「〇〇は?」等\n"
+                " - 購入リクエスト(承認必須): purchase_request\n"
+                "    └「〇〇買って」「〇〇注文して」「Amazonで〇〇を〇〇円まで」等。"
+                "    必ず max_price_yen (上限価格、円) を明確化する。"
+                "    曖昧な場合は item と max_price_yen を文脈から推定すること。\n\n"
                 "1発話に複数の依頼があれば、必要なツールを全て順番に呼ぶ。"
                 "操作の依頼が全くない発話には、ツールを呼ばずに空応答を返す。"
                 "会話的な返答・要約・翻訳・絵文字は禁止。\n\n"
@@ -1112,6 +1452,30 @@ class ApexVoiceApp(rumps.App):
             callback=self.change_hotkey,
         )
 
+        # 購入承認設定サブメニュー
+        purchase_menu = rumps.MenuItem("購入承認設定")
+        purchase_menu.add(rumps.MenuItem(
+            self._guardrail_per_request_label(),
+            callback=self.change_per_request_limit,
+        ))
+        purchase_menu.add(rumps.MenuItem(
+            self._guardrail_daily_label(),
+            callback=self.change_daily_limit,
+        ))
+        purchase_menu.add(rumps.MenuItem(
+            self._approval_mode_label(),
+            callback=self.toggle_approval_mode,
+        ))
+        purchase_menu.add(rumps.MenuItem(
+            self._approval_backend_label(),
+            callback=self.toggle_approval_backend,
+        ))
+        purchase_menu.add(rumps.MenuItem(
+            "履歴を見る…",
+            callback=self.show_purchase_history,
+        ))
+        self.item_purchase_menu = purchase_menu
+
         self.menu = [
             self.item_toggle,
             self.item_status,
@@ -1119,6 +1483,7 @@ class ApexVoiceApp(rumps.App):
             lang_menu,
             pp_menu,
             self.item_hotkey,
+            purchase_menu,
             None,
             rumps.MenuItem("感度を上げる (拾いやすく)", callback=self.sens_up),
             rumps.MenuItem("感度を下げる (拾いにくく)", callback=self.sens_down),
@@ -1226,6 +1591,131 @@ class ApexVoiceApp(rumps.App):
         self.hotkey_mgr.update(new_key)
         self.item_hotkey.title = self._hotkey_label(new_key)
         rumps.notification("Apex Voice", "ホットキー", self._hotkey_label(new_key))
+
+    # --- 購入承認関連 ---
+    def _current_guardrails(self):
+        cfg = load_config()
+        return {**DEFAULT_GUARDRAILS, **cfg.get("guardrails", {})}
+
+    def _guardrail_per_request_label(self):
+        g = self._current_guardrails()
+        return f"1回上限: ¥{g['max_amount_per_request']:,}"
+
+    def _guardrail_daily_label(self):
+        g = self._current_guardrails()
+        return f"1日累計上限: ¥{g['max_total_per_day']:,}"
+
+    def _approval_mode_label(self):
+        g = self._current_guardrails()
+        return "承認ダイアログ: " + ("ON" if g["require_approval"] else "OFF")
+
+    def _approval_backend_label(self):
+        cfg = load_config()
+        backend = cfg.get("approval_backend", "local")
+        nice = "ローカル(macOS)" if backend == "local" else "Slack(Aegis)"
+        return f"承認方式: {nice}"
+
+    def _ask_int(self, title: str, prompt: str, current: int) -> int:
+        w = rumps.Window(
+            message=prompt, title=title,
+            default_text=str(current),
+            ok="変更", cancel="キャンセル",
+        )
+        r = w.run()
+        if not r.clicked:
+            return None
+        try:
+            v = int(r.text.replace(",", "").replace("¥", "").strip())
+            if v < 0:
+                return None
+            return v
+        except ValueError:
+            rumps.notification("Apex Voice", "入力エラー", "整数で入力してください")
+            return None
+
+    def _refresh_purchase_menu_labels(self):
+        # サブメニュー項目を作り直すのは面倒なので、各titleを書き換える
+        items = list(self.item_purchase_menu.values())
+        if len(items) >= 4:
+            items[0].title = self._guardrail_per_request_label()
+            items[1].title = self._guardrail_daily_label()
+            items[2].title = self._approval_mode_label()
+            items[3].title = self._approval_backend_label()
+
+    def change_per_request_limit(self, _):
+        g = self._current_guardrails()
+        v = self._ask_int("1回あたり上限変更",
+                          "1回の購入で承認できる最大金額(円)を入力",
+                          g["max_amount_per_request"])
+        if v is None:
+            return
+        cfg = load_config()
+        cfg.setdefault("guardrails", {})["max_amount_per_request"] = v
+        save_config(cfg)
+        self._refresh_purchase_menu_labels()
+        rumps.notification("Apex Voice", "ガードレール更新", f"1回上限: ¥{v:,}")
+
+    def change_daily_limit(self, _):
+        g = self._current_guardrails()
+        v = self._ask_int("1日累計上限変更",
+                          "1日に承認できる合計金額(円)を入力",
+                          g["max_total_per_day"])
+        if v is None:
+            return
+        cfg = load_config()
+        cfg.setdefault("guardrails", {})["max_total_per_day"] = v
+        save_config(cfg)
+        self._refresh_purchase_menu_labels()
+        rumps.notification("Apex Voice", "ガードレール更新", f"1日累計上限: ¥{v:,}")
+
+    def toggle_approval_mode(self, _):
+        cfg = load_config()
+        g = cfg.setdefault("guardrails", {})
+        cur = g.get("require_approval", DEFAULT_GUARDRAILS["require_approval"])
+        g["require_approval"] = not cur
+        save_config(cfg)
+        self._refresh_purchase_menu_labels()
+        state = "ON" if g["require_approval"] else "OFF"
+        rumps.notification("Apex Voice", "承認ダイアログ", f"切替: {state}")
+
+    def toggle_approval_backend(self, _):
+        cfg = load_config()
+        cur = cfg.get("approval_backend", "local")
+        new = "slack" if cur == "local" else "local"
+        cfg["approval_backend"] = new
+        save_config(cfg)
+        self._refresh_purchase_menu_labels()
+        nice = "Slack(Aegis)" if new == "slack" else "ローカル(macOS)"
+        rumps.notification("Apex Voice", "承認方式切替", nice)
+
+    def show_purchase_history(self, _):
+        entries = _load_purchase_log()
+        if not entries:
+            rumps.alert(title="購入履歴", message="まだ履歴がありません")
+            return
+        # 直近20件を表示用に整形
+        recent = entries[-20:][::-1]
+        lines = []
+        emoji = {
+            "approved": "✅", "denied": "🛑",
+            "blocked_per_request_limit": "⛔",
+            "blocked_daily_limit": "⛔",
+        }
+        for e in recent:
+            mark = emoji.get(e.get("status", ""), "·")
+            date = e.get("date", "")[:16].replace("T", " ")
+            item = e.get("item", "?")
+            amount = e.get("amount", 0)
+            store = e.get("store") or "-"
+            lines.append(f"{mark} {date}  ¥{amount:,}  {item} [{store}]")
+        text = "\n".join(lines)
+        # rumps.Windowで表示(コピー可能)
+        w = rumps.Window(
+            message=text, title=f"購入履歴 (直近{len(recent)}件)",
+            default_text="", ok="閉じる", cancel=None,
+            dimensions=(600, 320),
+        )
+        w.run()
 
     def _make_pp_callback(self, key):
         def cb(_):
