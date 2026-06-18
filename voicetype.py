@@ -114,6 +114,11 @@ VOCAB_TOP_N = 30
 # OFFにしたい場合は空文字 "" を指定。
 DEFAULT_HOTKEY = "<ctrl>+<alt>+v"
 
+# Apex Voice Web 連携設定 (Vercel側へ認識テキストを送信)
+# 既定で無効。configから on にすると POST する。
+APEX_WEB_URL = os.environ.get("APEXVOICE_WEB_URL", "")        # 例 https://apex-voice-web.vercel.app
+APEX_WEB_TOKEN = os.environ.get("APEXVOICE_WEB_TOKEN", "")    # Vercel 側 APEX_VOICE_TOKEN と一致させる
+
 
 def load_config():
     try:
@@ -429,6 +434,67 @@ class MemoryManager:
                 log(f"クラウドから語彙{count}件取り込み(全session)")
         except Exception as e:
             log(f"AgentCore同期失敗: {e}")
+
+
+# ============================================================
+# Apex Voice Web 連携 (Vercelへの発話送信、非同期)
+# ============================================================
+class WebSender:
+    """認識テキストを Apex Voice Web (Vercel /api/ingest) に非同期POSTする。
+    URL未設定なら何もしない。失敗はログのみで握り潰す。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def is_configured(self) -> bool:
+        return bool(self._get_url())
+
+    def _get_url(self) -> str:
+        cfg = load_config()
+        # 設定優先順: config.web_url > 環境変数 APEXVOICE_WEB_URL
+        return (cfg.get("web_url") or APEX_WEB_URL or "").rstrip("/")
+
+    def _get_token(self) -> str:
+        cfg = load_config()
+        return cfg.get("web_token") or APEX_WEB_TOKEN or ""
+
+    def send(self, text: str, local_kind: str, local_message: str = None):
+        """non-blocking送信。OFFまたはURL未設定なら何もしない。"""
+        cfg = load_config()
+        if not cfg.get("web_enabled", False):
+            return
+        url = self._get_url()
+        if not url:
+            return
+        threading.Thread(
+            target=self._send_blocking,
+            args=(url, text, local_kind, local_message),
+            daemon=True,
+        ).start()
+
+    def _send_blocking(self, url: str, text: str,
+                       local_kind: str, local_message: str = None):
+        try:
+            import requests
+            payload = {
+                "text": text,
+                "localResult": {
+                    "kind": local_kind,
+                    **({"message": local_message} if local_message else {}),
+                },
+            }
+            headers = {"Content-Type": "application/json"}
+            token = self._get_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            r = requests.post(f"{url}/api/ingest", json=payload,
+                              headers=headers, timeout=10)
+            if r.status_code >= 400:
+                log(f"Web送信失敗 {r.status_code}: {r.text[:120]}")
+            else:
+                log(f"Web送信OK: {text[:30]}")
+        except Exception as e:
+            log(f"Web送信エラー: {e}")
 
 
 # ============================================================
@@ -1595,6 +1661,7 @@ class ApexVoiceApp(rumps.App):
         self.postprocessor = Postprocessor()
         self.agent = Agent()
         self.inserter = Inserter()
+        self.web_sender = WebSender()
         self.recorder = Recorder(on_segment=self._enqueue)
         self.jobs = queue.Queue()
 
@@ -1627,6 +1694,16 @@ class ApexVoiceApp(rumps.App):
         self.item_vocab_toggle = rumps.MenuItem(
             self._vocab_hint_label(),
             callback=self.toggle_vocab_hint,
+        )
+
+        # Web連携モード: 認識テキストをApex Voice Web(Vercel)へ非同期POST
+        self.item_web_toggle = rumps.MenuItem(
+            self._web_mode_label(),
+            callback=self.toggle_web_mode,
+        )
+        self.item_web_url = rumps.MenuItem(
+            self._web_url_label(),
+            callback=self.change_web_url,
         )
 
         # ホットキー表示メニュー（クリックで変更ダイアログ）
@@ -1668,6 +1745,8 @@ class ApexVoiceApp(rumps.App):
             self.item_hotkey,
             purchase_menu,
             self.item_vocab_toggle,
+            self.item_web_toggle,
+            self.item_web_url,
             None,
             rumps.MenuItem("感度を上げる (拾いやすく)", callback=self.sens_up),
             rumps.MenuItem("感度を下げる (拾いにくく)", callback=self.sens_down),
@@ -1826,6 +1905,55 @@ class ApexVoiceApp(rumps.App):
         rumps.notification(
             "Apex Voice", "語彙ヒント注入",
             f"切替: {state}\n(OFFにすると幻聴が減ることがあります)"
+        )
+
+    # --- Web連携モード ---
+    def _web_mode_label(self):
+        on = self.config.get("web_enabled", False)
+        url = self.config.get("web_url") or APEX_WEB_URL or ""
+        configured = "(URL未設定)" if not url else ""
+        return f"Web連携モード: {'ON' if on else 'OFF'}{configured}"
+
+    def _web_url_label(self):
+        url = self.config.get("web_url") or APEX_WEB_URL or ""
+        short = url.replace("https://", "").replace("http://", "")[:30] if url else "未設定"
+        return f"Web URL: {short}…"
+
+    def toggle_web_mode(self, _):
+        cur = self.config.get("web_enabled", False)
+        url = self.config.get("web_url") or APEX_WEB_URL or ""
+        if not cur and not url:
+            rumps.alert(
+                title="Web URLが未設定です",
+                message="先に「Web URL」をクリックして Vercel デプロイURLを設定してください",
+            )
+            return
+        self.config["web_enabled"] = not cur
+        save_config(self.config)
+        self.item_web_toggle.title = self._web_mode_label()
+        state = "ON" if self.config["web_enabled"] else "OFF"
+        rumps.notification("Apex Voice", "Web連携モード", f"切替: {state}")
+
+    def change_web_url(self, _):
+        w = rumps.Window(
+            message=("Apex Voice Web (Vercel) のデプロイURL を入力。\n"
+                     "例: https://apex-voice-web.vercel.app\n"
+                     "(共有トークンが必要なら 環境変数 APEXVOICE_WEB_TOKEN で設定)"),
+            title="Web連携: URL設定",
+            default_text=(self.config.get("web_url") or APEX_WEB_URL or ""),
+            ok="保存", cancel="キャンセル",
+        )
+        r = w.run()
+        if not r.clicked:
+            return
+        url = (r.text or "").strip().rstrip("/")
+        self.config["web_url"] = url
+        save_config(self.config)
+        self.item_web_url.title = self._web_url_label()
+        self.item_web_toggle.title = self._web_mode_label()
+        rumps.notification(
+            "Apex Voice", "Web URL設定",
+            f"設定済み: {url}" if url else "クリア",
         )
 
     def reset_vocab(self, _):
@@ -2021,14 +2149,19 @@ class ApexVoiceApp(rumps.App):
                     log(f"認識: {text}")
                     raw_text = text
                     final_text = text
+                    # Web連携用: ローカル実行が何だったかを記録
+                    web_kind = "text"
+                    web_message: str | None = None
+
                     if self.postprocess_mode == "agent":
                         result = self.agent.process(text)
                         if result["kind"] == "action":
                             rumps.notification(
                                 "Apex Voice", "アクション実行", result["message"]
                             )
-                            # アクション時は語彙学習しない
                             final_text = None
+                            web_kind = "action"
+                            web_message = result["message"]
                         else:
                             final_text = result["value"]
                             self.inserter.insert(
@@ -2043,11 +2176,17 @@ class ApexVoiceApp(rumps.App):
                         self.inserter.insert(
                             final_text, on_perm_error=self._warn_accessibility
                         )
-                    # 語彙学習は「ユーザーが実際に発話したRAWテキスト」のみを対象に。
-                    # LLM後処理結果・Web要約・整文後等を学習すると汎用語が増えて
-                    # Whisperを誤導(幻聴)するため記録しない。
+
+                    # 語彙学習(RAWテキストのみ)
                     if raw_text:
                         self.memory.record(raw_text, raw_text)
+
+                    # Apex Voice Web への非同期送信 (web_enabled=Trueのときのみ)
+                    if raw_text:
+                        try:
+                            self.web_sender.send(raw_text, web_kind, web_message)
+                        except Exception:
+                            pass
             except Exception as e:
                 log(f"認識エラー: {e}")
 
