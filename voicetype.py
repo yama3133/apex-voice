@@ -271,6 +271,9 @@ _VOCAB_STOPWORDS = {
     "場合", "時間", "問題", "対応", "確認", "状態", "状況", "内容",
     "皆様", "私達", "自分", "相手", "誰か", "何か",
 }
+# 語彙ヒント注入の閾値
+VOCAB_MIN_FREQ = 3      # この回数以上出現した語のみヒントに採用
+VOCAB_TOP_N_HINT = 15   # ヒントに採用する上位N語(注入過多で幻聴を招くため小さく)
 
 
 class MemoryManager:
@@ -369,10 +372,16 @@ class MemoryManager:
             log(f"AgentCore event書き込み失敗: {e}")
 
     def get_initial_prompt(self) -> str:
-        """Whisperに渡す initial_prompt: 上位N語の固有名詞・専門用語を列挙。
-        句読点ヒント付きの定型文も先頭に置いて句読点が付きやすくする。"""
+        """Whisperに渡す initial_prompt。
+        過剰注入は幻聴を招くため、出現回数 VOCAB_MIN_FREQ 以上の語のみ
+        上位 VOCAB_TOP_N_HINT 件に絞る。configで無効化可能。"""
+        # configで無効化されていれば空文字を返す
+        cfg = load_config()
+        if not cfg.get("vocab_hint_enabled", True):
+            return ""
         with self._lock:
-            top = sorted(self.vocab.items(), key=lambda x: -x[1])[:VOCAB_TOP_N]
+            filtered = [(t, c) for t, c in self.vocab.items() if c >= VOCAB_MIN_FREQ]
+            top = sorted(filtered, key=lambda x: -x[1])[:VOCAB_TOP_N_HINT]
         if not top:
             return ""
         terms = "、".join(t for t, _ in top)
@@ -408,7 +417,9 @@ class MemoryManager:
                 for ev in er.get("events", []):
                     for blk in ev.get("payload", []):
                         conv = blk.get("conversational")
-                        if conv and conv.get("role") == "ASSISTANT":
+                        # USER(生音声テキスト)から学習。
+                        # ASSISTANT(LLM出力)は汎用語が多くWhisperを誤導するため除外。
+                        if conv and conv.get("role") == "USER":
                             txt = conv.get("content", {}).get("text", "")
                             for term in self._extract_terms(txt):
                                 self.vocab[term] = self.vocab.get(term, 0) + 1
@@ -648,6 +659,93 @@ AGENT_DISPATCH = {
     "create_calendar_event": _action_create_calendar_event,
     "open_url_or_search": _action_open_url_or_search,
 }
+
+
+# ----------- アプリ起動 -----------
+def _action_open_app(app_name: str) -> str:
+    r = subprocess.run(["open", "-a", app_name], capture_output=True, text=True)
+    if r.returncode == 0:
+        return f"アプリ起動: {app_name}"
+    return f"アプリ起動失敗({app_name}): {r.stderr.strip()}"
+
+
+# ----------- メモ追加(Notes.app) -----------
+def _action_add_note(title: str, body: str = "") -> str:
+    safe_title = title.replace('"', '\\"').replace("\n", " ")
+    safe_body = (body or "").replace('"', '\\"').replace("\n", "<br>")
+    script = (
+        'tell application "Notes"\n'
+        f'  set newNote to make new note with properties {{name:"{safe_title}", '
+        f'body:"<h1>{safe_title}</h1>{safe_body}"}}\n'
+        'end tell'
+    )
+    code, out = _osascript(script)
+    if code == 0:
+        return f"メモ追加: 「{title}」"
+    return f"メモ追加失敗: {out}"
+
+
+# ----------- メール下書き(Mail.app) -----------
+def _action_compose_email(to: str, subject: str = "", body: str = "") -> str:
+    safe_to = to.replace('"', '\\"')
+    safe_subject = subject.replace('"', '\\"')
+    safe_body = (body or "").replace('"', '\\"')
+    script = (
+        'tell application "Mail"\n'
+        f'  set newMessage to make new outgoing message with properties '
+        f'{{subject:"{safe_subject}", content:"{safe_body}", visible:true}}\n'
+        '  tell newMessage\n'
+        f'    make new to recipient at end of to recipients '
+        f'with properties {{address:"{safe_to}"}}\n'
+        '  end tell\n'
+        '  activate\n'
+        'end tell'
+    )
+    code, out = _osascript(script)
+    if code == 0:
+        return f"メール下書き: {to} 「{subject or '(無題)'}」"
+    return f"メール下書き失敗: {out}"
+
+
+# ----------- システム操作(音量・明度・ダークモード) -----------
+def _action_system_control(action: str, value: int = None) -> str:
+    """action: volume_up/volume_down/volume_mute/volume_set/
+              brightness_up/brightness_down/
+              dark_mode_on/dark_mode_off/dark_mode_toggle"""
+    a = (action or "").lower()
+    if a == "volume_set" and value is not None:
+        v = max(0, min(100, int(value)))
+        _osascript(f"set volume output volume {v}")
+        return f"音量: {v}%"
+    if a == "volume_up":
+        _osascript("set volume output volume ((output volume of (get volume settings)) + 10)")
+        return "音量を上げました"
+    if a == "volume_down":
+        _osascript("set volume output volume ((output volume of (get volume settings)) - 10)")
+        return "音量を下げました"
+    if a == "volume_mute":
+        _osascript("set volume with output muted")
+        return "ミュートしました"
+    if a == "brightness_up":
+        # F15キーシミュレートで明度UP(全てのMacで動くわけではないが多くで動作)
+        subprocess.run(["osascript", "-e",
+                        'tell application "System Events" to key code 144'])
+        return "画面を明るくしました"
+    if a == "brightness_down":
+        subprocess.run(["osascript", "-e",
+                        'tell application "System Events" to key code 145'])
+        return "画面を暗くしました"
+    if a == "dark_mode_on":
+        _osascript('tell app "System Events" to tell appearance preferences to set dark mode to true')
+        return "ダークモードON"
+    if a == "dark_mode_off":
+        _osascript('tell app "System Events" to tell appearance preferences to set dark mode to false')
+        return "ダークモードOFF"
+    if a == "dark_mode_toggle":
+        _osascript('tell app "System Events" to tell appearance preferences '
+                   'to set dark mode to not dark mode')
+        return "ダークモード切替"
+    return f"未対応のシステム操作: {action}"
 
 
 # ----------- 購入承認(Guardrails for AgentCore Payments) -----------
@@ -1109,6 +1207,56 @@ class Agent:
             return msg
 
         @tool
+        def open_app(app_name: str) -> str:
+            """macOS上の任意のアプリを起動する。「〇〇を開いて」「〇〇起動」等で使う。
+
+            Args:
+                app_name: アプリ名(例: Slack, Notion, Safari, Mail, Visual Studio Code)
+            """
+            msg = _action_open_app(app_name)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def add_note(title: str, body: str = "") -> str:
+            """macOSのメモ(Notes)アプリにメモを追加する。「メモして」「アイデア記録」等で使う。
+
+            Args:
+                title: メモのタイトル(または短い件名)
+                body: 本文(任意)
+            """
+            msg = _action_add_note(title, body)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def compose_email(to: str, subject: str = "", body: str = "") -> str:
+            """Mail.appに新規メールの下書きを作成して表示する(送信はしない、ユーザーが手動送信)。
+
+            Args:
+                to: 宛先メールアドレス
+                subject: 件名
+                body: 本文(改行は自然に含めてOK)
+            """
+            msg = _action_compose_email(to, subject, body)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def system_control(action: str, value: int = None) -> str:
+            """システム操作(音量・明度・ダークモード)を実行する。
+
+            Args:
+                action: volume_up / volume_down / volume_mute / volume_set
+                       / brightness_up / brightness_down
+                       / dark_mode_on / dark_mode_off / dark_mode_toggle
+                value: volume_set 時の音量(0-100、任意)
+            """
+            msg = _action_system_control(action, value)
+            actions.append(msg)
+            return msg
+
+        @tool
         def purchase_request(item: str, max_price_yen: int,
                              store: str = None, note: str = None) -> str:
             """購入リクエストを起こす(ガードレール+ユーザー承認必須)。
@@ -1143,6 +1291,7 @@ class Agent:
 
         return [create_reminder, create_calendar_event,
                 open_url_or_search, web_fetch_and_summarize,
+                open_app, add_note, compose_email, system_control,
                 purchase_request]
 
     def _ensure(self):
@@ -1155,16 +1304,24 @@ class Agent:
             now = datetime.now()
             system_prompt = (
                 "あなたは音声入力アシスタントです。ユーザー発話を分析し、"
-                "次の5操作の明確な依頼が含まれていればツールを順に呼び出す:\n"
+                "次の操作の明確な依頼が含まれていればツールを順に呼び出す:\n"
                 " - リマインダー追加: create_reminder\n"
                 " - カレンダー予定作成: create_calendar_event\n"
                 " - URL/検索をブラウザで開く: open_url_or_search\n"
                 " - Web内容を要約 or 質問に回答: web_fetch_and_summarize\n"
-                "    └「〇〇調べて」「〇〇について教えて」「〇〇要約して」「〇〇は?」等\n"
+                "    └「〇〇調べて」「〇〇について教えて」「〇〇要約して」等\n"
+                " - アプリ起動: open_app\n"
+                "    └「Slackを開いて」「Notion起動して」「Safariを立ち上げて」等\n"
+                " - メモ追加: add_note\n"
+                "    └「メモして〇〇」「アイデア記録: 〇〇」「Notesに〇〇って残して」等\n"
+                " - メール下書き作成: compose_email\n"
+                "    └「〇〇さんにメール下書きして」(宛先メアド要)\n"
+                " - システム操作: system_control\n"
+                "    └「音量上げて/下げて/ミュート」「画面明るく/暗く」"
+                "「ダークモードに/解除」等\n"
                 " - 購入リクエスト(承認必須): purchase_request\n"
-                "    └「〇〇買って」「〇〇注文して」「Amazonで〇〇を〇〇円まで」等。"
-                "    必ず max_price_yen (上限価格、円) を明確化する。"
-                "    曖昧な場合は item と max_price_yen を文脈から推定すること。\n\n"
+                "    └「〇〇買って」「Amazonで〇〇を〇〇円まで」等。"
+                "必ず max_price_yen を明確化する\n\n"
                 "1発話に複数の依頼があれば、必要なツールを全て順番に呼ぶ。"
                 "操作の依頼が全くない発話には、ツールを呼ばずに空応答を返す。"
                 "会話的な返答・要約・翻訳・絵文字は禁止。\n\n"
@@ -1283,19 +1440,39 @@ class Recorder:
         self._start_blocks = max(1, int(START_SEC / BLOCK_SEC))
         self._auto_stop_blocks = int(AUTO_STOP_SEC / BLOCK_SEC)
 
-    def start(self):
-        dev = resolve_device()
+    def start(self, device=None):
+        # device指定があればそれを使い、なければ resolve_device()→OS既定
+        if device is None:
+            device = resolve_device()
         try:
-            shown = dev if dev is not None else sd.default.device[0]
+            shown = device if device is not None else sd.default.device[0]
             name = sd.query_devices(shown)["name"]
         except Exception:
             name = "(デフォルト)"
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            blocksize=BLOCK, device=dev, callback=self._callback,
+            blocksize=BLOCK, device=device, callback=self._callback,
         )
         self.stream.start()
-        log(f"マイク入力ストリーム開始: [{dev if dev is not None else 'OS既定'}] {name}")
+        self._current_device = device
+        log(f"マイク入力ストリーム開始: [{device if device is not None else 'OS既定'}] {name}")
+
+    def switch_device(self, device):
+        """録音中でも安全に入力デバイスを切替える。"""
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                log(f"既存ストリーム停止失敗: {e}")
+            self.stream = None
+        # 内部状態リセット
+        self._speaking = False
+        self._buf = []
+        self._silence_blocks = 0
+        self._hot_blocks = 0
+        self._idle_blocks = 0
+        self.start(device=device)
 
     def stop(self):
         if self.stream:
@@ -1446,6 +1623,12 @@ class ApexVoiceApp(rumps.App):
             self.pp_items[key] = item
             pp_menu.add(item)
 
+        # 語彙ヒント注入トグル(過剰注入で幻聴が出ることがあるため切れるように)
+        self.item_vocab_toggle = rumps.MenuItem(
+            self._vocab_hint_label(),
+            callback=self.toggle_vocab_hint,
+        )
+
         # ホットキー表示メニュー（クリックで変更ダイアログ）
         self.item_hotkey = rumps.MenuItem(
             self._hotkey_label(self.config.get("hotkey", DEFAULT_HOTKEY)),
@@ -1484,29 +1667,38 @@ class ApexVoiceApp(rumps.App):
             pp_menu,
             self.item_hotkey,
             purchase_menu,
+            self.item_vocab_toggle,
             None,
             rumps.MenuItem("感度を上げる (拾いやすく)", callback=self.sens_up),
             rumps.MenuItem("感度を下げる (拾いにくく)", callback=self.sens_down),
             None,
+            rumps.MenuItem("マイクを再取得 (OS既定を読み直す)", callback=self.refresh_mic),
+            rumps.MenuItem("学習語彙をリセット", callback=self.reset_vocab),
+            rumps.MenuItem("再起動 (Apex Voice)", callback=self.restart_app),
+            None,
             rumps.MenuItem("終了", callback=self.quit_app),
         ]
 
-        # 録音とワーカーを開始（録音は停止状態でスタート。メニューの「録音開始」で開始する）
-        self.recorder.start()
-        threading.Thread(target=self._worker, daemon=True).start()
+        # 録音とワーカー(デバッグ用に環境変数で完全無効化可能)
+        if not os.environ.get("APEXVOICE_NO_AUDIO"):
+            self.recorder.start(device=None)
+            threading.Thread(target=self._worker, daemon=True).start()
+        else:
+            log("[DEBUG] APEXVOICE_NO_AUDIO=1: 録音無効モード")
 
-        # グローバルホットキー
-        self.hotkey = self.config.get("hotkey", DEFAULT_HOTKEY)
-        self.hotkey_mgr = HotkeyManager(self.hotkey, lambda: self.toggle(None))
-        self.hotkey_mgr.start()
+        # グローバルホットキー(同上)
+        if not os.environ.get("APEXVOICE_NO_HOTKEY"):
+            self.hotkey = self.config.get("hotkey", DEFAULT_HOTKEY)
+            self.hotkey_mgr = HotkeyManager(self.hotkey, lambda: self.toggle(None))
+            self.hotkey_mgr.start()
+        else:
+            log("[DEBUG] APEXVOICE_NO_HOTKEY=1: ホットキー無効モード")
+            self.hotkey_mgr = HotkeyManager("", lambda: None)
 
     # ---- 自動停止のUI同期 ----
-    @rumps.timer(1)
-    def _sync_state(self, _):
-        if not self.recorder.listening and self.title == ICON_REC:
-            self.title = ICON_IDLE
-            self.item_toggle.title = "🎤 録音開始"
-            self.item_status.title = "状態: 停止中(自動)"
+    # 注: アイコンタイトルは触らない(メニューを閉じる)。
+    # 自動停止時はrecorderが内部でlisteningをFalseにするので、
+    # 次回ユーザーがクリックした時に正しい状態が見える。
 
     # ---- メニュー操作 ----
     def toggle(self, _):
@@ -1591,6 +1783,70 @@ class ApexVoiceApp(rumps.App):
         self.hotkey_mgr.update(new_key)
         self.item_hotkey.title = self._hotkey_label(new_key)
         rumps.notification("Apex Voice", "ホットキー", self._hotkey_label(new_key))
+
+    # --- マイク再取得 / アプリ再起動 ---
+    def refresh_mic(self, _):
+        """OS既定マイクを読み直す。システム設定でマイクを切替えた後に使う。"""
+        try:
+            self.recorder.switch_device(None)
+            try:
+                name = sd.query_devices(sd.default.device[0]).get("name", "?")
+            except Exception:
+                name = "(OS既定)"
+            rumps.notification("Apex Voice", "マイク再取得", f"現在: {name}")
+            log(f"OS既定マイクを読み直し: {name}")
+        except Exception as e:
+            log(f"マイク再取得失敗: {e}")
+            rumps.notification("Apex Voice", "マイク再取得失敗", str(e))
+
+    def restart_app(self, _):
+        """Apex Voice 自身を再起動する。"""
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:
+            pass
+        try:
+            self.recorder.stop()
+        except Exception:
+            pass
+        # 同じプロセスとしてexec(設定や環境を引継ぎ)
+        log("Apex Voiceを再起動します")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _vocab_hint_label(self):
+        on = self.config.get("vocab_hint_enabled", True)
+        return f"語彙ヒント注入: {'ON' if on else 'OFF'}"
+
+    def toggle_vocab_hint(self, _):
+        cur = self.config.get("vocab_hint_enabled", True)
+        self.config["vocab_hint_enabled"] = not cur
+        save_config(self.config)
+        self.item_vocab_toggle.title = self._vocab_hint_label()
+        state = "OFF" if cur else "ON"
+        rumps.notification(
+            "Apex Voice", "語彙ヒント注入",
+            f"切替: {state}\n(OFFにすると幻聴が減ることがあります)"
+        )
+
+    def reset_vocab(self, _):
+        w = rumps.Window(
+            message="学習した語彙(ローカルキャッシュ)を全削除します。\n"
+                    "クラウド(AgentCore Memory)の履歴は残り、次回起動時に再構築されます。\n"
+                    "本当に削除しますか?",
+            title="学習語彙のリセット",
+            default_text="",
+            ok="削除する", cancel="キャンセル",
+        )
+        r = w.run()
+        if not r.clicked:
+            return
+        try:
+            self.memory.vocab.clear()
+            self.memory._save_local()
+            rumps.notification("Apex Voice", "語彙リセット", "ローカル語彙を削除しました")
+            log("ローカル語彙をリセット")
+        except Exception as e:
+            log(f"語彙リセット失敗: {e}")
 
     # --- 購入承認関連 ---
     def _current_guardrails(self):
@@ -1754,7 +2010,10 @@ class ApexVoiceApp(rumps.App):
         while True:
             audio = self.jobs.get()
             try:
-                self.title = ICON_WORK
+                # メニュー項目への書き込みは一切行わない(背景ノイズで頻繁に走ると
+                # メニューバーを開いた瞬間に閉じてしまうため)。
+                # 状態はログにのみ出す。
+                log("認識処理開始")
                 text = self.transcriber.transcribe(audio)
                 if text and looks_like_hallucination(text):
                     log(f"幻聴として破棄: {text[:30]}")
@@ -1784,13 +2043,13 @@ class ApexVoiceApp(rumps.App):
                         self.inserter.insert(
                             final_text, on_perm_error=self._warn_accessibility
                         )
-                    # 挿入したテキストを語彙学習へ
-                    if final_text:
-                        self.memory.record(raw_text, final_text)
+                    # 語彙学習は「ユーザーが実際に発話したRAWテキスト」のみを対象に。
+                    # LLM後処理結果・Web要約・整文後等を学習すると汎用語が増えて
+                    # Whisperを誤導(幻聴)するため記録しない。
+                    if raw_text:
+                        self.memory.record(raw_text, raw_text)
             except Exception as e:
                 log(f"認識エラー: {e}")
-            finally:
-                self.title = ICON_REC if self.recorder.listening else ICON_IDLE
 
     def _warn_accessibility(self):
         rumps.notification(
