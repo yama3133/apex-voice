@@ -18,6 +18,12 @@ import json
 import time
 import zlib
 import queue
+
+try:
+    import setproctitle
+    setproctitle.setproctitle("Apex Voice")
+except ImportError:
+    pass
 import threading
 import subprocess
 from pathlib import Path
@@ -242,9 +248,11 @@ class Inserter:
         text = text.strip()
         if not text:
             return
+        log(f"挿入開始: {text[:30]}")
         prev = self._pb_get()                       # 既存クリップボードを退避
         self._pb_set(text)                          # 認識結果をコピー
         ok = self._paste()                          # Cmd+V を送出
+        log(f"貼り付け結果: ok={ok}")
         time.sleep(0.15)
         self._pb_set(prev)                          # クリップボードを復元
         if not ok and on_perm_error and not self.accessibility_warned:
@@ -254,7 +262,9 @@ class Inserter:
     def _paste(self) -> bool:
         # System Events 経由で Cmd+V。アクセシビリティ権限が必要。
         script = 'tell application "System Events" to keystroke "v" using command down'
-        r = subprocess.run(["osascript", "-e", script], capture_output=True)
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"osascriptエラー: {r.stderr.strip()[:120]}")
         return r.returncode == 0
 
 
@@ -1633,14 +1643,14 @@ class Recorder:
 # ============================================================
 # メニューバー常駐アプリ
 # ============================================================
-ICON_IDLE = "🎤"     # 待機中（クリックで録音開始）
-ICON_REC = "🔴"      # 録音中（クリックで停止）
-ICON_WORK = "✍️"     # 認識処理中
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_IDLE = os.path.join(_APP_DIR, "icons", "mic_idle.png")
+ICON_REC  = os.path.join(_APP_DIR, "icons", "mic_rec.png")
 
 
 class ApexVoiceApp(rumps.App):
     def __init__(self):
-        super().__init__(ICON_IDLE, quit_button=None)
+        super().__init__("", icon=ICON_IDLE, template=True, quit_button=None)
 
         # 設定読み込み: configファイルに保存された言語があれば反映（環境変数指定がない場合のみ）
         self.config = load_config()
@@ -1784,7 +1794,7 @@ class ApexVoiceApp(rumps.App):
         if not self.recorder.listening:
             # 録音開始
             self.recorder.listening = True
-            self.title = ICON_REC
+            self.icon = ICON_REC
             self.item_toggle.title = "■ 録音停止"
             self.item_status.title = "状態: 録音中"
             log("録音開始")
@@ -1792,7 +1802,7 @@ class ApexVoiceApp(rumps.App):
             # 録音停止 → 残りのバッファを確定して認識
             self.recorder.listening = False
             self.recorder.flush()
-            self.title = ICON_IDLE
+            self.icon = ICON_IDLE
             self.item_toggle.title = "🎤 録音開始"
             self.item_status.title = "状態: 停止中"
             log("録音停止")
@@ -1879,7 +1889,8 @@ class ApexVoiceApp(rumps.App):
             rumps.notification("Apex Voice", "マイク再取得失敗", str(e))
 
     def restart_app(self, _):
-        """Apex Voice 自身を再起動する。"""
+        """Apex Voice 自身を再起動する（LaunchAgentのKeepAliveで自動復帰）。"""
+        log("Apex Voiceを再起動します")
         try:
             self.hotkey_mgr.stop()
         except Exception:
@@ -1888,9 +1899,7 @@ class ApexVoiceApp(rumps.App):
             self.recorder.stop()
         except Exception:
             pass
-        # 同じプロセスとしてexec(設定や環境を引継ぎ)
-        log("Apex Voiceを再起動します")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        rumps.quit_application()
 
     def _vocab_hint_label(self):
         on = self.config.get("vocab_hint_enabled", True)

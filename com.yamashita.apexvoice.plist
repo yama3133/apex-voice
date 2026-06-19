@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for Apex Voice
+  リポジトリのclone先に応じて以下のパスを書き換えること:
+    /Users/YOUR_NAME/path/to/apex-voice/.venv/bin/python
+    /Users/YOUR_NAME/path/to/apex-voice/voicetype.py
+    /Users/YOUR_NAME (HOME)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yamashita.apexvoice</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_NAME/path/to/apex-voice/.venv/bin/python</string>
+        <string>/Users/YOUR_NAME/path/to/apex-voice/voicetype.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/apexvoice.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/apexvoice.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_NAME</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

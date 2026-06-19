@@ -28,8 +28,22 @@ cd apex-voice
 .venv/bin/python voicetype.py
 ```
 
-### 2. ビルド済み `.app` を使う
-[Releases](https://github.com/yama3133/apex-voice/releases) から `ApexVoice.app.zip` をダウンロード → 展開 → **右クリック → 開く**（未署名のため初回のみ）。
+### 2. LaunchAgentで常駐させる（推奨）
+ログイン時に自動起動・クラッシュ時に自動復帰する方式。`.app`バンドルより安定。
+
+```bash
+# plistのパスは絶対パスなので、リポジトリのcloneパスに合わせて編集が必要
+cp com.yamashita.apexvoice.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
+```
+
+停止・再起動:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
+launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
+```
+
+ログ: `/tmp/apexvoice.log`
 
 ## 権限（初回だけ必要）
 1. **マイク** — 初回録音時に許可
@@ -95,12 +109,12 @@ cd apex-voice
 | `APEXVOICE_MEMORY_ID` | (既定値あり) | AgentCore Memory ストアID |
 | `APEXVOICE_ACTOR_ID` | `default-user` | Memory上のユーザー識別子 |
 
-## `.app` ビルド
+## `.app` ビルド（参考・非推奨）
 ```bash
 .venv/bin/python setup.py py2app
 # → dist/Apex Voice.app
 ```
-未署名のため配布先では **初回だけ右クリック→開く**。サイズは約900MB（mlx・numpy・boto3・PyObjC同梱）。
+py2app は `python312.zip` 破損問題が起きやすく、`mlx-whisper` の読み込みが不安定なため非推奨。常駐運用には上記の **LaunchAgent 方式** を推奨。
 
 ## 仕組み
 ```
@@ -115,6 +129,7 @@ cd apex-voice
 ```
 
 ## バージョン履歴
+- **v0.2.1** — LaunchAgent方式に変更（安定動作）／メニューバーアイコンを SF Symbols PNG 化／プロセス名を `setproctitle` で固定／Apex Voice Web 連携
 - **v0.2.0** — Apex Voice にリネーム。Strands Agents マルチステップ、Web取得+要約、AgentCore Memory、グローバルホットキー追加
 - **v0.1.0** — 初期リリース (WhisType として公開)
 

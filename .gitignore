@@ -11,6 +11,7 @@ venv/
 # py2app build artifacts
 build/
 dist/
+ApexVoice.app/
 
 # テスト/ローカル生成物
 test.aiff

@@ -41,7 +41,16 @@ OPTIONS = {
     },
     # ネイティブ依存はパッケージ丸ごと同梱する
     "packages": ["mlx_whisper", "mlx", "sounddevice", "numpy", "rumps",
-                 "huggingface_hub", "certifi", "tqdm"],
+                 "huggingface_hub", "certifi", "tqdm",
+                 "pynput", "boto3", "botocore", "requests",
+                 "bs4", "mcp", "anyio", "strands", "bedrock_agentcore"],
+    # py2app が動的importを見落とすサブモジュールを明示
+    "includes": [
+        "pynput.keyboard._darwin",
+        "pynput.mouse._darwin",
+    ],
+    # すべてのパッケージをzipに詰めない（mlx等の大きなネイティブ拡張はzip化で壊れる）
+    "zip_include_packages": [],
 }
 
 setup(
