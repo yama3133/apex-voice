@@ -1145,12 +1145,17 @@ def _log_purchase(item: str, amount: int, store: str, status: str, url: str = No
 
 
 # ----------- Web取得 + Claude要約 -----------
-# requests + BeautifulSoup でHTML取得→本文抽出→Bedrockで要約
-# (JS必須サイトは AgentCore Browser SDK 経由に拡張可能。v1はシンプル版)
+# 二段構え:
+#   1) requests + BeautifulSoup で静的HTMLを取得(高速・無料)
+#   2) 失敗・空・要JS・Googleブロック等の場合は
+#      AgentCore Browser(マネージドChromium+Playwright)へエスカレーション
 _WEB_FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X) ApexVoice/0.2",
     "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
 }
+
+# 本文がこれより短ければBrowserフォールバックに回す
+_MIN_USEFUL_TEXT_LEN = 200
 
 
 def _fetch_page_text(url: str, max_chars: int = 8000) -> str:
@@ -1167,6 +1172,75 @@ def _fetch_page_text(url: str, max_chars: int = 8000) -> str:
     main = (soup.find("article") or soup.find("main") or soup.body or soup)
     text = " ".join(main.get_text(separator=" ", strip=True).split())
     return text[:max_chars]
+
+
+# ----------- AgentCore Browser 経由のWeb取得 -----------
+# マネージドのChromium環境にPlaywrightでCDP接続する。
+# JS必須サイト、Googleの検索結果ページ、bot対策の強いページに対しても
+# 安定して本文を取得できる。
+def _agentcore_browser_session():
+    """AgentCore Browserセッションを起動して (client, ws_url, headers) を返す。"""
+    from bedrock_agentcore.tools.browser_client import BrowserClient
+    client = BrowserClient(region=BEDROCK_REGION)
+    client.start()
+    ws_url, headers = client.generate_ws_headers()
+    return client, ws_url, headers
+
+
+def _agentcore_fetch_text(url: str, max_chars: int = 8000,
+                          wait_ms: int = 2000) -> str:
+    """AgentCore Browser経由で url を開き、本文テキストを返す。"""
+    from playwright.sync_api import sync_playwright
+    client, ws_url, headers = _agentcore_browser_session()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(ws_url, headers=headers)
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(wait_ms)  # 動的描画待ち
+            text = page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            text = " ".join(text.split())
+            return text[:max_chars]
+    finally:
+        try:
+            client.stop()
+        except Exception:
+            pass
+
+
+def _agentcore_google_first_url(query: str):
+    """Google検索の1位リンクをAgentCore Browser経由で取得する。
+    requests版がブロックされた時のフォールバック。"""
+    import urllib.parse
+    from playwright.sync_api import sync_playwright
+    client, ws_url, headers = _agentcore_browser_session()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(ws_url, headers=headers)
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            search_url = ("https://www.google.com/search?q="
+                          + urllib.parse.quote_plus(query))
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1500)
+            # 結果リンクを取得(h3を含むaタグの親aを優先)
+            href = page.evaluate("""() => {
+                const a = document.querySelector('div#search a:has(h3)')
+                       || document.querySelector('a:has(h3)')
+                       || document.querySelector('div#search a');
+                return a ? a.href : null;
+            }""")
+            if href and "google.com" not in href:
+                return href
+            return None
+    finally:
+        try:
+            client.stop()
+        except Exception:
+            pass
 
 
 def _summarize_with_claude(content: str, question: str = None) -> str:
@@ -1194,37 +1268,73 @@ def _summarize_with_claude(content: str, question: str = None) -> str:
 
 def _action_web_fetch_and_summarize(url: str = None, query: str = None,
                                     question: str = None) -> str:
-    """URLまたは検索クエリで取得→要約。質問があればそれに答える形で。"""
+    """URLまたは検索クエリで取得→要約。質問があればそれに答える形で。
+
+    取得は二段構え:
+      1) requests + BeautifulSoup (高速)
+      2) 失敗 or 本文が薄ければ AgentCore Browser に切り替え
+    """
     target_url = url
+
+    # ----- 検索クエリ→URL解決 -----
     if not target_url and query:
-        # Google検索結果ページから1位リンクを抜く
         import requests, urllib.parse
         from bs4 import BeautifulSoup
-        search_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+        search_url = ("https://www.google.com/search?q="
+                      + urllib.parse.quote_plus(query))
         try:
             r = requests.get(search_url, headers=_WEB_FETCH_HEADERS, timeout=10)
             soup = BeautifulSoup(r.content, "html.parser")
-            # Google検索結果の最初のリンク取得(構造変化に弱いがv1としては可)
             for a in soup.find_all("a"):
                 href = a.get("href", "")
                 if href.startswith("/url?q="):
-                    target_url = urllib.parse.unquote(href.split("/url?q=")[1].split("&")[0])
+                    target_url = urllib.parse.unquote(
+                        href.split("/url?q=")[1].split("&")[0])
                     break
                 if href.startswith("http") and "google.com" not in href:
                     target_url = href
                     break
         except Exception as e:
-            return f"検索失敗: {e}"
+            log(f"Google検索(requests)失敗: {e}、AgentCore Browserへ切替")
+
+        # requests で取れなければ AgentCore Browser
+        if not target_url:
+            try:
+                log(f"AgentCore Browserで検索: {query}")
+                target_url = _agentcore_google_first_url(query)
+            except Exception as e:
+                return f"検索失敗(AgentCore Browser): {e}"
+
     if not target_url:
         return "URLも検索クエリも特定できませんでした"
+
+    # ----- 本文取得(requests → 薄ければ Browser) -----
+    text = ""
+    used_browser = False
     try:
         text = _fetch_page_text(target_url)
-        if not text:
-            return f"本文取得失敗: {target_url}"
+    except Exception as e:
+        log(f"本文取得(requests)失敗: {e}、AgentCore Browserへ切替")
+
+    if not text or len(text) < _MIN_USEFUL_TEXT_LEN:
+        try:
+            log(f"AgentCore Browserで本文取得: {target_url}")
+            text = _agentcore_fetch_text(target_url)
+            used_browser = True
+        except Exception as e:
+            if not text:
+                return f"本文取得失敗(AgentCore Browser): {e} ({target_url})"
+
+    if not text:
+        return f"本文取得失敗: {target_url}"
+
+    try:
         summary = _summarize_with_claude(text, question)
+        if used_browser:
+            log(f"AgentCore Browser要約完了: {target_url}")
         return summary
     except Exception as e:
-        return f"取得・要約エラー({target_url}): {e}"
+        return f"要約エラー({target_url}): {e}"
 
 
 class Agent:

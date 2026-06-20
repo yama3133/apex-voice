@@ -13,3 +13,4 @@ beautifulsoup4
 mcp
 anyio
 setproctitle
+playwright
