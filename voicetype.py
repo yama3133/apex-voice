@@ -116,9 +116,11 @@ _migrate_legacy_config()
 VOCAB_TOP_N = 30
 
 # グローバルホットキー（pynput形式の文字列）。configで上書き可。
-# 例: "<ctrl>+<alt>+v" / "<cmd>+<shift>+<space>" / "<f5>"
+# 例: "<f19>" / "<ctrl>+<alt>+v" / "<cmd>+<shift>+<space>"
 # OFFにしたい場合は空文字 "" を指定。
-DEFAULT_HOTKEY = "<ctrl>+<alt>+v"
+# 既定の <f19> は Karabiner-Elements で caps_lock を f19 にリマップする想定。
+# 詳細は README の「ホットキー(Caps Lock ワンキー化)」セクション参照。
+DEFAULT_HOTKEY = "<f19>"
 
 # Apex Voice Web 連携設定 (Vercel側へ認識テキストを送信)
 # 既定で無効。configから on にすると POST する。

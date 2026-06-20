@@ -1,0 +1,20 @@
+{
+    "title": "Apex Voice — Caps Lock to F19",
+    "rules": [
+        {
+            "description": "Caps Lock -> F19 (for Apex Voice)",
+            "manipulators": [
+                {
+                    "type": "basic",
+                    "from": {
+                        "key_code": "caps_lock",
+                        "modifiers": { "optional": ["any"] }
+                    },
+                    "to": [
+                        { "key_code": "f19" }
+                    ]
+                }
+            ]
+        }
+    ]
+}

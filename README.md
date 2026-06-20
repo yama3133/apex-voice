@@ -10,7 +10,7 @@ macOSメニューバーに常駐する **音声タイピング＋AIエージェ�
   - macOS連携: リマインダー / カレンダー / URLオープン
   - Web取得 + 要約 (1発話で複数ツール順次実行)
 - **語彙学習**: Amazon Bedrock AgentCore Memory に固有名詞・専門用語を蓄積し、Whisperに自動ヒント注入
-- **グローバルホットキー**: ⌃⌥V でどこからでも録音トグル
+- **グローバルホットキー**: 既定は `<f19>`（Karabiner-Elementsで Caps Lock を F19 にリマップして「Caps Lock ワンキー」運用を推奨）
 - 多言語対応（11言語をメニューから切替）
 
 ## 動作環境
@@ -50,7 +50,7 @@ launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
 ## 権限（初回だけ必要）
 1. **マイク** — 初回録音時に許可
 2. **アクセシビリティ** — 他アプリへ貼り付け（Cmd+V送出）に必須
-3. **入力監視** — グローバルホットキー（⌃⌥V）に必要
+3. **入力監視** — グローバルホットキー (`<f19>` 等) に必要
 4. **AWS認証** — 後処理・エージェント・Memory機能を使う場合（`aws login`）
 
 ## メニュー
@@ -59,7 +59,7 @@ launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
 
 | 項目 | 内容 |
 |---|---|
-| 🎤 録音開始 / ■ 録音停止 | クリックで録音トグル（ホットキー ⌃⌥V でも可） |
+| 🎤 録音開始 / ■ 録音停止 | クリックで録音トグル（ホットキー `<f19>` / Caps Lock でも可） |
 | 状態 | 録音中 / 停止中 |
 | 言語 | 11言語切替（自動判定/日本語/English/中文/한국어/Español/Français/Deutsch/Italiano/Português/Русский） |
 | 後処理 | 生 / 整文 / 敬語化 / 英訳 / 箇条書き / **エージェント実行** |
@@ -98,6 +98,26 @@ launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
   - x402 対応エンドポイントに対し、ユーザーの埋込みクリプトウォレット (Coinbase CDP / Stripe Privy) から決済
   - ガードレール+承認ダイアログを経由
 - **ウォレット残高確認** — 「BASE_SEPOLIAのUSDC残高は」等
+
+## ホットキー（Caps Lock ワンキー化）
+
+既定のホットキーは `<f19>`。物理的にF19が無いキーボード（MacBook内蔵等）でも、**Karabiner-Elements** で Caps Lock を F19 にリマップすれば「**Caps Lock ワンキーで録音トグル**」になります。
+
+```bash
+# 1) Karabiner-Elements インストール
+brew install --cask karabiner-elements
+
+# 2) 起動して、入力監視・アクセシビリティ・システム拡張をすべて許可
+open -a "Karabiner-Elements"
+
+# 3) リポジトリ同梱のルールを Karabiner にimport
+#    Karabiner-Elements を起動した状態で以下のURLを開く
+open "karabiner://karabiner/assets/complex_modifications/import?url=file://$(pwd)/karabiner/caps_lock_to_f19.json"
+```
+
+UI で「Add new」を押せば `Caps Lock -> F19 (for Apex Voice)` が一覧に出るので Enable に。これで Caps Lock を押すたびに録音トグルされます。
+
+別のキーにしたい場合は `~/.apexvoice/config.json` の `hotkey` を編集（例: `"<ctrl>+<alt>+v"`、`"<f18>"`、`""` でOFF）。
 
 ## 語彙メモリ（AgentCore Memory）
 
@@ -152,6 +172,7 @@ py2app は `python312.zip` 破損問題が起きやすく、`mlx-whisper` の読
 ```
 
 ## バージョン履歴
+- **v0.2.2** — AgentCore Browser でWeb取得・検索を強化／AgentCore Payments (x402) 実装／既定ホットキーを `<f19>` に変更し Karabiner-Elements 連携で Caps Lock ワンキー化を推奨
 - **v0.2.1** — LaunchAgent方式に変更（安定動作）／メニューバーアイコンを SF Symbols PNG 化／プロセス名を `setproctitle` で固定／Apex Voice Web 連携
 - **v0.2.0** — Apex Voice にリネーム。Strands Agents マルチステップ、Web取得+要約、AgentCore Memory、グローバルホットキー追加
 - **v0.1.0** — 初期リリース (WhisType として公開)
