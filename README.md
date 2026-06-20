@@ -89,7 +89,15 @@ launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
 - **カレンダー予定作成** — 「明日の3時に田中さんと打ち合わせをカレンダーに入れて」
 - **URL/検索を開く** — 「PythonのドキュメントをWebで検索して」
 - **Web取得+要約** — 「Pythonの公式サイトから最新バージョン教えて」「Wikipediaで富士山について調べて」
-  - 内容を取得→Claude Haiku 4.5で要約→カーソル位置に挿入
+  - 第1段: `requests` + BeautifulSoup（高速・無料）
+  - 第2段: 失敗・本文薄・JS必須なら **AgentCore Browser** (マネージドChromium+Playwright) にエスカレーション
+  - 取得→Claude Haiku 4.5で要約→カーソル位置に挿入
+- **アプリ起動 / メモ追加 / メール下書き / システム操作** — 「Slack開いて」「メモして〇〇」「田中さんにメール下書き」「音量上げて」等
+- **購入リクエスト(承認必須)** — 「Amazonで〇〇を1000円までで買って」(現状は検索URL表示まで)
+- **AgentCore Payments(承認必須)** — 「この有料APIに$0.05まで支払って」
+  - x402 対応エンドポイントに対し、ユーザーの埋込みクリプトウォレット (Coinbase CDP / Stripe Privy) から決済
+  - ガードレール+承認ダイアログを経由
+- **ウォレット残高確認** — 「BASE_SEPOLIAのUSDC残高は」等
 
 ## 語彙メモリ（AgentCore Memory）
 
@@ -110,6 +118,19 @@ launchctl load ~/Library/LaunchAgents/com.yamashita.apexvoice.plist
 | `APEXVOICE_BEDROCK_REGION` | `us-east-1` | Bedrockリージョン |
 | `APEXVOICE_MEMORY_ID` | (既定値あり) | AgentCore Memory ストアID |
 | `APEXVOICE_ACTOR_ID` | `default-user` | Memory上のユーザー識別子 |
+| `APEXVOICE_PAYMENT_MANAGER_ARN` | (空) | AgentCore Payments の PaymentManager ARN |
+| `APEXVOICE_PAYMENT_INSTRUMENT_ID` | (空) | 埋込みクリプトウォレットの Payment Instrument ID |
+| `APEXVOICE_PAYMENT_CONNECTOR_ID` | (空) | 残高照会に使う Payment Connector ID |
+| `APEXVOICE_PAYMENT_USER_ID` | `apex-voice-user` | Payments上のユーザー識別子 |
+| `APEXVOICE_PAYMENT_NETWORK` | `base-sepolia` | x402 優先ネットワーク (base-sepolia/base/solana-mainnet 等) |
+
+### AgentCore Payments のセットアップ
+1. AWSコンソールまたは `bedrock_agentcore.payments.PaymentClient.create_payment_manager_with_connector()` で **PaymentManager + Connector** を作成（Coinbase CDP か Stripe Privy の認証情報が必要）
+2. `PaymentManager.create_payment_instrument()` で **埋込みクリプトウォレット** を作成
+3. 返却された redirectUrl からウォレットにファンドし、署名権限を付与
+4. 上記環境変数を `~/Library/LaunchAgents/com.yamashita.apexvoice.plist` の `EnvironmentVariables` に設定して LaunchAgent をリロード
+
+詳細は SDK 同梱の `bedrock_agentcore/payments/README.md` を参照。
 
 ## `.app` ビルド（参考・非推奨）
 ```bash

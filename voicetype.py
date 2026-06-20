@@ -1144,6 +1144,143 @@ def _log_purchase(item: str, amount: int, store: str, status: str, url: str = No
     _save_purchase_log(entries)
 
 
+# ----------- AgentCore Payments (x402 マイクロトランザクション) -----------
+# AIエージェントが有料API/コンテンツに対し、ユーザーのウォレットから
+# 自動決済する仕組み。Coinbase CDP または Stripe Privy 連携の
+# Payment Manager をAWSコンソール等で事前作成する必要がある。
+#
+# 必要な環境変数:
+#   APEXVOICE_PAYMENT_MANAGER_ARN     PaymentManager の ARN
+#   APEXVOICE_PAYMENT_INSTRUMENT_ID   ユーザーの Embedded Crypto Wallet ID
+#   APEXVOICE_PAYMENT_CONNECTOR_ID    残高照会用(Coinbase/Stripe connector)
+#   APEXVOICE_PAYMENT_USER_ID         ユーザー識別子(任意、既定 apex-voice-user)
+#   APEXVOICE_PAYMENT_NETWORK         優先ネットワーク(既定 base-sepolia)
+PAYMENT_MANAGER_ARN = os.environ.get("APEXVOICE_PAYMENT_MANAGER_ARN", "")
+PAYMENT_INSTRUMENT_ID = os.environ.get("APEXVOICE_PAYMENT_INSTRUMENT_ID", "")
+PAYMENT_CONNECTOR_ID = os.environ.get("APEXVOICE_PAYMENT_CONNECTOR_ID", "")
+PAYMENT_USER_ID = os.environ.get("APEXVOICE_PAYMENT_USER_ID", "apex-voice-user")
+PAYMENT_DEFAULT_NETWORK = os.environ.get("APEXVOICE_PAYMENT_NETWORK",
+                                         "base-sepolia")
+
+
+def _agentcore_payments_manager():
+    """PaymentManagerを生成。設定不足ならNone。"""
+    if not PAYMENT_MANAGER_ARN:
+        return None
+    from bedrock_agentcore.payments import PaymentManager
+    return PaymentManager(
+        payment_manager_arn=PAYMENT_MANAGER_ARN,
+        region_name=BEDROCK_REGION,
+    )
+
+
+def _action_pay_for_paid_resource(url: str, max_amount_usd: float,
+                                  description: str = "") -> str:
+    """AgentCore Paymentsで x402 決済し、有料リソースを取得する。
+
+    フロー:
+      1) URLにGET → HTTP 402 Payment Required を受け取る
+      2) PaymentManager で短期セッション作成 (上限額 = max_amount_usd)
+      3) generate_payment_header で x402 支払いヘッダを生成
+      4) ヘッダ付きで再GET → リソース取得
+
+    承認モード(guardrails.require_approval=true)では事前にユーザー承認を求める。
+    """
+    if not PAYMENT_MANAGER_ARN or not PAYMENT_INSTRUMENT_ID:
+        return ("AgentCore Payments未設定: 環境変数 "
+                "APEXVOICE_PAYMENT_MANAGER_ARN と "
+                "APEXVOICE_PAYMENT_INSTRUMENT_ID が必要です。")
+
+    cfg = load_config()
+    grd = {**DEFAULT_GUARDRAILS, **cfg.get("guardrails", {})}
+    if grd.get("require_approval", True):
+        body = (f"AgentCore Payments(x402)で決済します。\n\n"
+                f"リソース: {url}\n"
+                f"上限額: ${max_amount_usd:.4f}\n"
+                f"ネットワーク優先: {PAYMENT_DEFAULT_NETWORK}\n"
+                f"用途: {description or '(未指定)'}")
+        backend = cfg.get("approval_backend", "local")
+        if backend == "slack":
+            approved = _show_approval_via_slack(
+                "AgentCore Payments 承認", body, url,
+                int(max_amount_usd * 100), "agentcore-payments", description)
+        else:
+            approved = _show_approval_dialog(
+                "AgentCore Payments 承認", body)
+        if not approved:
+            return f"🛑 決済を拒否: {url}"
+
+    mgr = _agentcore_payments_manager()
+    import requests
+    try:
+        # 1) 有料リソースを叩いて 402 をもらう
+        r1 = requests.get(url, timeout=10)
+        if r1.status_code != 402:
+            return (f"対象URLが 402 を返しません(status={r1.status_code})。"
+                    f"x402非対応エンドポイントの可能性: {url}")
+
+        # 2) 短期セッション作成
+        session = mgr.create_payment_session(
+            expiry_time_in_minutes=15,
+            user_id=PAYMENT_USER_ID,
+            limits={"maxSpendAmount": {
+                "value": f"{max_amount_usd:.4f}",
+                "currency": "USD"}},
+        )
+        session_id = session["paymentSessionId"]
+
+        # 3) x402 支払いヘッダ生成
+        try:
+            body_402 = r1.json()
+        except Exception:
+            body_402 = {}
+        header = mgr.generate_payment_header(
+            payment_instrument_id=PAYMENT_INSTRUMENT_ID,
+            payment_session_id=session_id,
+            payment_required_request={
+                "statusCode": 402,
+                "headers": dict(r1.headers),
+                "body": body_402,
+            },
+            user_id=PAYMENT_USER_ID,
+            network_preferences=[PAYMENT_DEFAULT_NETWORK,
+                                 "base", "solana-mainnet"],
+        )
+
+        # 4) 支払いヘッダ付きで再リクエスト
+        r2 = requests.get(url, headers=header, timeout=30)
+        if r2.ok:
+            msg = (f"✅ AgentCore Payments 決済成功: {url} "
+                   f"(上限 ${max_amount_usd:.4f}, session={session_id[:12]}…)")
+            log(msg)
+            return msg
+        return (f"⚠️ 支払いヘッダ付き再送が {r2.status_code} で失敗。"
+                f"session={session_id[:12]}…")
+    except Exception as e:
+        return f"AgentCore Payments失敗: {e}"
+
+
+def _action_check_payment_balance(chain: str = "BASE_SEPOLIA",
+                                  token: str = "USDC") -> str:
+    """設定済み Payment Instrument の残高を返す。"""
+    if not (PAYMENT_MANAGER_ARN and PAYMENT_INSTRUMENT_ID
+            and PAYMENT_CONNECTOR_ID):
+        return ("AgentCore Payments未設定: ARN/INSTRUMENT_ID/CONNECTOR_ID "
+                "の3つの環境変数が必要です。")
+    mgr = _agentcore_payments_manager()
+    try:
+        balance = mgr.get_payment_instrument_balance(
+            payment_connector_id=PAYMENT_CONNECTOR_ID,
+            payment_instrument_id=PAYMENT_INSTRUMENT_ID,
+            chain=chain,
+            token=token,
+            user_id=PAYMENT_USER_ID,
+        )
+        return f"残高: {balance}"
+    except Exception as e:
+        return f"残高取得失敗: {e}"
+
+
 # ----------- Web取得 + Claude要約 -----------
 # 二段構え:
 #   1) requests + BeautifulSoup で静的HTMLを取得(高速・無料)
@@ -1459,6 +1596,36 @@ class Agent:
             return msg
 
         @tool
+        def pay_for_paid_resource(url: str, max_amount_usd: float,
+                                  description: str = "") -> str:
+            """AgentCore Paymentsで有料API/コンテンツを x402 決済する。
+            「この有料APIに支払って」「x402で〇〇取得」等で使う。
+            ガードレール+ユーザー承認必須。
+
+            Args:
+                url: 有料リソースのURL(HTTP 402 を返すx402対応エンドポイント)
+                max_amount_usd: 上限額(USD)。例 0.05 = 5セント
+                description: 用途・補足メモ(任意)
+            """
+            msg = _action_pay_for_paid_resource(url, max_amount_usd, description)
+            actions.append(msg)
+            return msg
+
+        @tool
+        def check_payment_balance(chain: str = "BASE_SEPOLIA",
+                                  token: str = "USDC") -> str:
+            """AgentCore Paymentsで設定済みウォレットの残高を確認する。
+            「残高見せて」「ウォレット残高は」等で使う。
+
+            Args:
+                chain: チェーン名(BASE_SEPOLIA / BASE / SOLANA_DEVNET 等)
+                token: トークン名(USDC 等)
+            """
+            msg = _action_check_payment_balance(chain, token)
+            actions.append(msg)
+            return msg
+
+        @tool
         def web_fetch_and_summarize(url: str = None, query: str = None,
                                     question: str = None) -> str:
             """Webページの内容を取得し、Claudeで要約または質問に答える。
@@ -1478,7 +1645,8 @@ class Agent:
         return [create_reminder, create_calendar_event,
                 open_url_or_search, web_fetch_and_summarize,
                 open_app, add_note, compose_email, system_control,
-                purchase_request]
+                purchase_request,
+                pay_for_paid_resource, check_payment_balance]
 
     def _ensure(self):
         if self._agent is not None:
@@ -1507,7 +1675,12 @@ class Agent:
                 "「ダークモードに/解除」等\n"
                 " - 購入リクエスト(承認必須): purchase_request\n"
                 "    └「〇〇買って」「Amazonで〇〇を〇〇円まで」等。"
-                "必ず max_price_yen を明確化する\n\n"
+                "必ず max_price_yen を明確化する\n"
+                " - 有料API/コンテンツのx402決済(承認必須): pay_for_paid_resource\n"
+                "    └「この有料APIに支払って」「x402で〇〇に決済」等。"
+                "URLと max_amount_usd を必ず明確化する\n"
+                " - ウォレット残高確認: check_payment_balance\n"
+                "    └「残高見せて」「ウォレット残高は」「BASEのUSDCいくら」等\n\n"
                 "1発話に複数の依頼があれば、必要なツールを全て順番に呼ぶ。"
                 "操作の依頼が全くない発話には、ツールを呼ばずに空応答を返す。"
                 "会話的な返答・要約・翻訳・絵文字は禁止。\n\n"
