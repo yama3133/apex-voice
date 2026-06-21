@@ -1742,6 +1742,50 @@ class Agent:
 
 
 # ============================================================
+# Silero VAD (高精度な音声区間検出)
+# ============================================================
+# 既定のRMSベースVAD後の最終ゲート。Whisperに渡す前に「本当に発話があるか」を
+# Silero VADで再確認し、無ければ即破棄する(幻聴源を断つ)。
+_SILERO_VAD_MODEL = None  # None=未試行 / False=ロード失敗 / <model>=ロード済み
+
+
+def _silero_load():
+    global _SILERO_VAD_MODEL
+    if _SILERO_VAD_MODEL is not None:
+        return _SILERO_VAD_MODEL or None
+    try:
+        from silero_vad import load_silero_vad
+        _SILERO_VAD_MODEL = load_silero_vad()
+        log("Silero VAD ロード完了")
+    except Exception as e:
+        log(f"Silero VAD ロード失敗: {e}（VADフォールバック）")
+        _SILERO_VAD_MODEL = False
+    return _SILERO_VAD_MODEL or None
+
+
+def _silero_has_speech(audio: np.ndarray, sr: int = 16000) -> bool:
+    """音声内に発話区間があるか判定。ロード失敗時は True(従来動作)。"""
+    model = _silero_load()
+    if model is None:
+        return True
+    try:
+        import torch
+        from silero_vad import get_speech_timestamps
+        a = audio if audio.dtype == np.float32 else audio.astype(np.float32)
+        ts = get_speech_timestamps(
+            torch.from_numpy(a),
+            model,
+            sampling_rate=sr,
+            min_speech_duration_ms=200,
+            threshold=0.5,
+        )
+        return bool(ts)
+    except Exception as e:
+        log(f"Silero VAD判定エラー: {e}（許可フォールバック）")
+        return True
+
+
+# ============================================================
 # 文字起こし（mlx-whisper）
 # ============================================================
 class Transcriber:
@@ -1759,6 +1803,19 @@ class Transcriber:
 
     def transcribe(self, audio: np.ndarray) -> str:
         self._ensure()
+
+        # [対策3] 録音長下限: 0.4秒未満は雑音と見なして破棄
+        duration_sec = len(audio) / 16000.0
+        if duration_sec < 0.4:
+            log(f"短すぎる音声を破棄 ({duration_sec:.2f}s)")
+            return ""
+
+        # [対策4] Silero VADで「音声区間が含まれるか」をチェック
+        # 含まれなければWhisperに渡さず即時破棄(幻聴源を断つ)
+        if not _silero_has_speech(audio):
+            log("Silero VAD: 音声区間なしと判定 → 破棄")
+            return ""
+
         # 音量が小さいと幻聴が増えるためピーク正規化で底上げ
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
         if peak > 0:
@@ -1766,7 +1823,8 @@ class Transcriber:
         kwargs = dict(
             path_or_hf_repo=self.model,
             condition_on_previous_text=False,    # 直前テキストへの引きずられ(反復幻聴)を防ぐ
-            no_speech_threshold=0.5,             # 無音をより無音と判定しやすく
+            no_speech_threshold=0.7,             # [対策1] 0.5→0.7 無音と判定しやすく
+            logprob_threshold=-0.5,              # [対策2] 自信なし出力は破棄(既定-1.0)
             compression_ratio_threshold=2.2,     # 反復だらけの結果を弾く
         )
         if self.language:
