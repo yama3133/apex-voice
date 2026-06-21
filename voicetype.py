@@ -37,7 +37,7 @@ from AppKit import NSPasteboard, NSPasteboardTypeString
 # 設定（環境変数で上書き可）
 # ============================================================
 # 認識モデル（HuggingFace上のmlx-community形式）。初回起動時に自動DLされる。
-MODEL = os.environ.get("VOICETYPE_MODEL", "mlx-community/whisper-large-v3-turbo")
+MODEL = os.environ.get("VOICETYPE_MODEL", "mlx-community/whisper-large-v3-turbo-q4")
 # 認識言語（自動判定にしたい場合は空文字 "" にする）
 # 環境変数が指定されていればそれを優先。空ならconfigファイルから読み込む。
 LANGUAGE = os.environ.get("VOICETYPE_LANG", "ja")
@@ -260,13 +260,16 @@ class Inserter:
         text = text.strip()
         if not text:
             return
-        log(f"挿入開始: {text[:30]}")
+        t0 = time.time()
         prev = self._pb_get()                       # 既存クリップボードを退避
         self._pb_set(text)                          # 認識結果をコピー
         ok = self._paste()                          # Cmd+V を送出
-        log(f"貼り付け結果: ok={ok}")
-        time.sleep(0.15)
-        self._pb_set(prev)                          # クリップボードを復元
+        log(f"挿入完了 ok={ok} ({(time.time()-t0)*1000:.0f}ms): {text[:30]}")
+        # クリップボード復元はバックグラウンド遅延でOK(ユーザー体感に影響しない)
+        def _restore_later():
+            time.sleep(0.05)
+            self._pb_set(prev)
+        threading.Thread(target=_restore_later, daemon=True).start()
         if not ok and on_perm_error and not self.accessibility_warned:
             self.accessibility_warned = True
             on_perm_error()
@@ -1776,7 +1779,7 @@ def _silero_has_speech(audio: np.ndarray, sr: int = 16000) -> bool:
             torch.from_numpy(a),
             model,
             sampling_rate=sr,
-            min_speech_duration_ms=200,
+            min_speech_duration_ms=150,  # 短い「はい」等を取りこぼさない
             threshold=0.5,
         )
         return bool(ts)
@@ -1811,10 +1814,11 @@ class Transcriber:
             return ""
 
         # [対策4] Silero VADで「音声区間が含まれるか」をチェック
-        # 含まれなければWhisperに渡さず即時破棄(幻聴源を断つ)
+        t_vad = time.time()
         if not _silero_has_speech(audio):
             log("Silero VAD: 音声区間なしと判定 → 破棄")
             return ""
+        vad_ms = (time.time() - t_vad) * 1000
 
         # 音量が小さいと幻聴が増えるためピーク正規化で底上げ
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
@@ -1826,6 +1830,7 @@ class Transcriber:
             no_speech_threshold=0.7,             # [対策1] 0.5→0.7 無音と判定しやすく
             logprob_threshold=-0.5,              # [対策2] 自信なし出力は破棄(既定-1.0)
             compression_ratio_threshold=2.2,     # 反復だらけの結果を弾く
+            temperature=0.0,                     # fallback(0.0→0.2→...)を廃止しレイテンシ削減
         )
         if self.language:
             kwargs["language"] = self.language
@@ -1839,8 +1844,13 @@ class Transcriber:
                 prompt_parts.append(mp)
         if prompt_parts:
             kwargs["initial_prompt"] = " ".join(prompt_parts)
+        t_w = time.time()
         result = self._mlx.transcribe(audio, **kwargs)
-        return (result.get("text") or "").strip()
+        whisper_ms = (time.time() - t_w) * 1000
+        text = (result.get("text") or "").strip()
+        log(f"認識所要 audio={duration_sec:.2f}s vad={vad_ms:.0f}ms "
+            f"whisper={whisper_ms:.0f}ms → {len(text)}文字")
+        return text
 
 
 # ============================================================

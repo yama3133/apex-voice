@@ -128,7 +128,7 @@ UI で「Add new」を押せば `Caps Lock -> F19 (for Apex Voice)` が一覧に
 ## 設定（環境変数）
 | 変数 | 既定 | 説明 |
 |---|---|---|
-| `VOICETYPE_MODEL` | `mlx-community/whisper-large-v3-turbo` | 認識モデル |
+| `VOICETYPE_MODEL` | `mlx-community/whisper-large-v3-turbo-q4` | 認識モデル（4bit量子化版・サイズ約350MB、精度同等） |
 | `VOICETYPE_LANG` | `ja` | 認識言語（空文字で自動判定） |
 | `VOICETYPE_PROMPT` | (空) | 追加の用語ヒント |
 | `VOICETYPE_SENSITIVITY` | `2.5` | VAD閾値（小さいほど拾いやすい） |
