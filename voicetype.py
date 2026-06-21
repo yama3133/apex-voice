@@ -186,15 +186,21 @@ def resolve_device():
     return None
 
 
-# Whisperが無音/不明瞭音声で吐きがちなYouTube字幕系の定型句
-HALLUCINATION_PHRASES = (
-    "ご視聴ありがとうございました",
-    "ご清聴ありがとうございました",
+# Whisperが無音/不明瞭音声で吐きがちなYouTube字幕系の定型句。
+# STRONG: 含まれた時点で問答無用で破棄(明確にYouTube系の定型句)
+STRONG_HALLUCINATION_PHRASES = (
+    "ご視聴ありがとう",
+    "ご清聴ありがとう",
     "最後までご視聴",
     "チャンネル登録",
     "高評価",
     "次の動画",
     "また次回",
+    "お会いしましょう",
+    "皆さんこんにちは",
+)
+# WEAK: 普通の会話でも使うので、フレーズが主成分のときだけ破棄
+WEAK_HALLUCINATION_PHRASES = (
     "おやすみなさい",
 )
 
@@ -220,9 +226,13 @@ def looks_like_hallucination(text: str) -> bool:
             return True
     if len(t) >= 12 and _compression_ratio(text) >= 3.0:  # 反復が支配的
         return True
-    # YouTube字幕系の定型句が主成分
+    # YouTube字幕系の強い定型句は含まれた時点で破棄
+    for p in STRONG_HALLUCINATION_PHRASES:
+        if p in text:
+            return True
+    # 弱い定型句はフレーズが主成分のときだけ破棄
     stripped = text
-    for p in HALLUCINATION_PHRASES:
+    for p in WEAK_HALLUCINATION_PHRASES:
         stripped = stripped.replace(p, "")
     if stripped != text and len(stripped.strip(" 　、。.,!?！？")) < 6:
         return True
