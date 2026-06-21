@@ -16,6 +16,8 @@ import threading
 import subprocess
 from pathlib import Path
 
+print("STEP1: 標準ライブラリ読み込み完了", flush=True)
+
 try:
     import setproctitle
     setproctitle.setproctitle("Apex Voice")
@@ -436,6 +438,7 @@ def _make_icon(recording: bool = False):
 
 class ApexVoiceApp:
     def __init__(self):
+        print("STEP2: ApexVoiceApp.__init__ 開始", flush=True)
         self.config       = load_config()
         self.postprocess  = self.config.get("postprocess", "raw")
         self.recording    = False
@@ -451,7 +454,9 @@ class ApexVoiceApp:
         hotkey = self.config.get("hotkey", DEFAULT_HOTKEY)
         self.hotkey_mgr = HotkeyManager(hotkey, self._toggle)
 
+        print("STEP3: pystray import 開始", flush=True)
         import pystray
+        print("STEP4: pystray.Icon 作成開始", flush=True)
         self._icon = pystray.Icon(
             "ApexVoice",
             _make_icon(False),
