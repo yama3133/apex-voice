@@ -1911,86 +1911,59 @@ class Recorder:
 
     def flush(self):
         """録音停止時に、録音中の残りバッファを確定して認識へ回す。"""
-        if self._speaking and self._buf:
+        if self._buf:
             self._finalize()
         else:
-            self._buf = []
             self._speaking = False
             self._silence_blocks = 0
-
-    def _threshold(self):
-        # 環境ノイズ × 感度 を発話判定の閾値にする（最低ラインあり）
-        return max(self._noise_rms * SENSITIVITY, 0.006)
 
     def _callback(self, indata, frames, time_info, status):
         if status:
             # オーバーフロー等。致命的でないのでログのみ。
             pass
         block = indata[:, 0].copy()
-        rms = float(np.sqrt(np.mean(block * block)) + 1e-12)
 
         if not self.listening:
-            # 待機中も環境ノイズだけは緩く追従させておく
+            # 待機中は環境ノイズ更新だけ
+            rms = float(np.sqrt(np.mean(block * block)) + 1e-12)
             self._noise_rms = 0.95 * self._noise_rms + 0.05 * rms
             return
 
-        thresh = self._threshold()
+        # push-to-talk: listening中はVAD判定せず全ブロックを積む。
+        # (環境音/幻聴は後段の Silero VAD + Whisperフィルタで弾く)
+        if not self._speaking:
+            self._speaking = True
+            self._buf = list(self._pre)   # 頭切れ防止に直前数ブロックを先頭に
+        self._buf.append(block)
 
         if DEBUG:
             self._dbg += 1
-            if self._dbg % 10 == 0:  # 約1秒ごと
+            if self._dbg % 10 == 0:
+                rms = float(np.sqrt(np.mean(block * block)) + 1e-12)
                 bar = "#" * min(40, int(rms * 400))
-                log(f"RMS={rms:.4f} 閾値={thresh:.4f} {'[発話中]' if self._speaking else ''} {bar}")
-
-        if rms > thresh:
-            self._hot_blocks += 1
-            self._idle_blocks = 0
-            if not self._speaking and self._hot_blocks >= self._start_blocks:
-                self._speaking = True
-                self._buf = list(self._pre)   # 頭の数ブロックを先頭に付ける
-            if self._speaking:
-                self._buf.append(block)
-                self._silence_blocks = 0
-        else:
-            self._hot_blocks = 0
-            if self._speaking:
-                self._buf.append(block)       # 末尾の無音も少し含める
-                self._silence_blocks += 1
-                if self._silence_blocks >= self._silence_limit:
-                    self._finalize()
-            else:
-                # 無音中は環境ノイズを推定更新し、長く続いたら自動停止
-                self._noise_rms = 0.9 * self._noise_rms + 0.1 * rms
-                self._idle_blocks += 1
-                if self._idle_blocks >= self._auto_stop_blocks:
-                    self._idle_blocks = 0
-                    self.listening = False
-                    log("無音が続いたため録音を自動停止しました")
+                log(f"RMS={rms:.4f} 録音中 blocks={len(self._buf)} {bar}")
 
         # 頭切れ防止用リングバッファ更新
         self._pre.append(block)
         if len(self._pre) > self._pre_blocks:
             self._pre.pop(0)
 
-        # 長すぎる発話は強制確定
-        if self._speaking and len(self._buf) >= self._max_blocks:
+        # 長すぎる発話は強制確定（最大長保護）
+        if len(self._buf) >= self._max_blocks:
+            log(f"最大録音長に到達 ({self._max_blocks*BLOCK_SEC:.0f}s) 強制確定")
             self._finalize()
 
     def _finalize(self):
         buf, self._buf = self._buf, []
         self._speaking = False
         self._silence_blocks = 0
-        if len(buf) >= self._min_blocks:
-            audio = np.concatenate(buf).astype(np.float32)
-            thresh = self._threshold()
-            # ピークが閾値を十分超えない区間はノイズ(幻聴の元)として破棄
-            if float(np.max(np.abs(audio))) < thresh * 1.5:
-                return
-            # 実際に声があったブロックが少なすぎる区間も破棄
-            active = sum(1 for b in buf if float(np.sqrt(np.mean(b * b))) > thresh)
-            if active < self._min_blocks:
-                return
-            self.on_segment(audio)
+        if not buf:
+            return
+        if len(buf) < self._min_blocks:
+            log(f"録音破棄: 短すぎ ({len(buf)*BLOCK_SEC:.2f}s)")
+            return
+        audio = np.concatenate(buf).astype(np.float32)
+        self.on_segment(audio)
 
 
 # ============================================================
@@ -2027,6 +2000,8 @@ class ApexVoiceApp(rumps.App):
         self.web_sender = WebSender()
         self.recorder = Recorder(on_segment=self._enqueue)
         self.jobs = queue.Queue()
+        # Silero VAD を起動時にバックグラウンドで先読み（初回発話で待たせない）
+        threading.Thread(target=_silero_load, daemon=True).start()
 
         self.item_toggle = rumps.MenuItem("🎤 録音開始", callback=self.toggle)
         self.item_status = rumps.MenuItem("状態: 停止中", callback=None)
