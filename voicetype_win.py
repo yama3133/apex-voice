@@ -303,17 +303,23 @@ class Inserter:
         try:
             import pyperclip
             from pynput.keyboard import Controller, Key
+            kb = Controller()
+            # タスクトレイ操作後はフォーカスが外れるので Alt+Tab で直前ウィンドウに戻す
+            time.sleep(0.15)
+            with kb.pressed(Key.alt):
+                kb.press(Key.tab)
+                kb.release(Key.tab)
+            time.sleep(0.2)
             prev = pyperclip.paste()
             pyperclip.copy(text)
             time.sleep(0.05)
-            kb = Controller()
             with kb.pressed(Key.ctrl):
                 kb.press('v')
                 kb.release('v')
             elapsed = (time.time() - t0) * 1000
             log(f"挿入完了 ({elapsed:.0f}ms): {text[:30]}")
             def _restore():
-                time.sleep(0.1)
+                time.sleep(0.2)
                 pyperclip.copy(prev)
             threading.Thread(target=_restore, daemon=True).start()
         except Exception as e:
