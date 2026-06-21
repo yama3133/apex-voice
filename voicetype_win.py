@@ -303,13 +303,16 @@ class Inserter:
         try:
             import pyperclip
             from pynput.keyboard import Controller, Key
+            import win32gui
             kb = Controller()
-            # タスクトレイ操作後はフォーカスが外れるので Alt+Tab で直前ウィンドウに戻す
-            time.sleep(0.15)
-            with kb.pressed(Key.alt):
-                kb.press(Key.tab)
-                kb.release(Key.tab)
-            time.sleep(0.2)
+            # タスクトレイ操作前のフォアグラウンドウィンドウを取得済みなら復元
+            prev_hwnd = getattr(self, '_prev_hwnd', None)
+            if prev_hwnd:
+                try:
+                    win32gui.SetForegroundWindow(prev_hwnd)
+                    time.sleep(0.15)
+                except Exception:
+                    pass
             prev = pyperclip.paste()
             pyperclip.copy(text)
             time.sleep(0.05)
@@ -482,6 +485,12 @@ class ApexVoiceApp:
 
     def _toggle(self, *_):
         if not self.recording:
+            # 録音開始前に現在のフォアグラウンドウィンドウを保存
+            try:
+                import win32gui
+                self.inserter._prev_hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                pass
             self.recording = True
             self.recorder.listening = True
             self._icon.icon = _make_icon(True)
