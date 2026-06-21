@@ -154,6 +154,8 @@ def _silero_has_speech(audio, sr: int = 16000) -> bool:
 # 録音 (push-to-talk)
 # ============================================================
 class Recorder:
+    """sounddeviceがARM64 Windowsで動かない場合、pyaudioにフォールバック。"""
+
     def __init__(self, on_segment):
         self.on_segment  = on_segment
         self.listening   = False
@@ -163,33 +165,54 @@ class Recorder:
         self._pre_blocks = int(PRE_PAD_SEC / BLOCK_SEC)
         self._max_blocks = int(MAX_SPEECH_SEC / BLOCK_SEC)
         self._stream     = None
-        self._dbg        = 0
+        self._pa         = None
+        self._thread     = None
+        self._stop_flag  = False
 
     def start(self):
+        # sounddeviceを試みてダメならpyaudioで起動
+        try:
+            self._start_sounddevice()
+        except Exception as e:
+            log(f"sounddevice失敗({e})、pyaudioで起動")
+            self._start_pyaudio()
+
+    def _start_sounddevice(self):
         import sounddevice as sd
-        import numpy as np
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCK,
-            dtype="float32", callback=self._callback
+            dtype="float32", callback=self._sd_callback
         )
         self._stream.start()
-        log("マイク入力ストリーム開始")
+        log("マイク入力ストリーム開始 (sounddevice)")
 
-    def stop(self):
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-    def flush(self):
-        if self._buf:
-            self._finalize()
-        else:
-            self._speaking = False
-
-    def _callback(self, indata, frames, time_info, status):
+    def _sd_callback(self, indata, frames, time_info, status):
         import numpy as np
-        block = indata[:, 0].copy()
+        self._process_block(indata[:, 0].copy())
+
+    def _start_pyaudio(self):
+        import pyaudio
+        self._pa = pyaudio.PyAudio()
+        self._stop_flag = False
+        self._stream = self._pa.open(
+            rate=SAMPLE_RATE, channels=1, format=pyaudio.paFloat32,
+            input=True, frames_per_buffer=BLOCK
+        )
+        self._thread = threading.Thread(target=self._pa_loop, daemon=True)
+        self._thread.start()
+        log("マイク入力ストリーム開始 (pyaudio)")
+
+    def _pa_loop(self):
+        import numpy as np
+        while not self._stop_flag:
+            try:
+                raw = self._stream.read(BLOCK, exception_on_overflow=False)
+                block = np.frombuffer(raw, dtype=np.float32).copy()
+                self._process_block(block)
+            except Exception:
+                break
+
+    def _process_block(self, block):
         if not self.listening:
             self._pre.append(block)
             if len(self._pre) > self._pre_blocks:
@@ -202,6 +225,25 @@ class Recorder:
         if len(self._buf) >= self._max_blocks:
             log(f"最大録音長に到達 ({MAX_SPEECH_SEC:.0f}s) 強制確定")
             self._finalize()
+
+    def stop(self):
+        self._stop_flag = True
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._pa:
+            self._pa.terminate()
+            self._pa = None
+
+    def flush(self):
+        if self._buf:
+            self._finalize()
+        else:
+            self._speaking = False
 
     def _finalize(self):
         import numpy as np
