@@ -170,25 +170,7 @@ class Recorder:
         self._stop_flag  = False
 
     def start(self):
-        # sounddeviceを試みてダメならpyaudioで起動
-        try:
-            self._start_sounddevice()
-        except Exception as e:
-            log(f"sounddevice失敗({e})、pyaudioで起動")
-            self._start_pyaudio()
-
-    def _start_sounddevice(self):
-        import sounddevice as sd
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCK,
-            dtype="float32", callback=self._sd_callback
-        )
-        self._stream.start()
-        log("マイク入力ストリーム開始 (sounddevice)")
-
-    def _sd_callback(self, indata, frames, time_info, status):
-        import numpy as np
-        self._process_block(indata[:, 0].copy())
+        self._start_pyaudio()
 
     def _start_pyaudio(self):
         import pyaudio
