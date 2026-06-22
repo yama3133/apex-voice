@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1120" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="winBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0078d4"/>
+      <stop offset="1" stop-color="#005a9e"/>
+    </linearGradient>
+    <linearGradient id="awsBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff9900"/>
+      <stop offset="1" stop-color="#cc7a00"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000" flood-opacity="0.15"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="1120" fill="#f5f6fa"/>
+
+  <text x="900" y="80" text-anchor="middle" font-size="46" font-weight="800" fill="#1a1a1a">Apex Voice for Windows — Architecture</text>
+  <text x="900" y="125" text-anchor="middle" font-size="22" fill="#555">Voice → local Whisper → insert into any app + optional Amazon Bedrock post-processing</text>
+
+  <!-- Local pipeline -->
+  <rect x="60" y="180" width="1180" height="780" rx="20" fill="url(#winBg)" opacity="0.08" stroke="#0078d4" stroke-width="2"/>
+  <text x="100" y="222" font-size="24" font-weight="700" fill="#0078d4">Windows Local Pipeline</text>
+
+  <g filter="url(#shadow)">
+    <rect x="100" y="270" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="220" y="312" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Microphone</text>
+    <text x="220" y="345" text-anchor="middle" font-size="16" fill="#555">pyaudio (ARM64 OK)</text>
+    <text x="220" y="365" text-anchor="middle" font-size="13" fill="#888">sounddevice fails</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="420" y="270" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="540" y="312" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Recorder</text>
+    <text x="540" y="345" text-anchor="middle" font-size="16" fill="#555">push-to-talk</text>
+    <text x="540" y="365" text-anchor="middle" font-size="13" fill="#888">0.5s pre-pad</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="740" y="270" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="860" y="312" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Silero VAD</text>
+    <text x="860" y="345" text-anchor="middle" font-size="16" fill="#555">speech gate</text>
+    <text x="860" y="365" text-anchor="middle" font-size="13" fill="#888">drop silence</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1060" y="270" width="160" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="1140" y="312" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Whisper</text>
+    <text x="1140" y="345" text-anchor="middle" font-size="16" fill="#555">faster-whisper</text>
+    <text x="1140" y="365" text-anchor="middle" font-size="13" fill="#888">CPU/int8</text>
+  </g>
+
+  <line x1="340" y1="325" x2="420" y2="325" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="660" y1="325" x2="740" y2="325" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="980" y1="325" x2="1060" y2="325" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="1060" y="430" width="160" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="1140" y="468" text-anchor="middle" font-size="18" font-weight="700" fill="#1a1a1a">Hallucination</text>
+    <text x="1140" y="490" text-anchor="middle" font-size="14" fill="#555">STRONG / WEAK</text>
+    <text x="1140" y="515" text-anchor="middle" font-size="12" fill="#888">filter YouTube tails</text>
+  </g>
+  <line x1="1140" y1="380" x2="1140" y2="430" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="740" y="430" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2" stroke-dasharray="6,4"/>
+    <text x="860" y="467" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Bedrock post-processing</text>
+    <text x="860" y="495" text-anchor="middle" font-size="13" fill="#555">polish / formal / translate / bullets</text>
+    <text x="860" y="515" text-anchor="middle" font-size="12" fill="#888">optional mode</text>
+  </g>
+  <line x1="1060" y1="485" x2="980" y2="485" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="420" y="430" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="540" y="467" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Foreground restore</text>
+    <text x="540" y="495" text-anchor="middle" font-size="14" fill="#555">pywin32</text>
+    <text x="540" y="515" text-anchor="middle" font-size="12" fill="#888">SetForegroundWindow</text>
+  </g>
+  <line x1="740" y1="485" x2="660" y2="485" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="100" y="430" width="240" height="110" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="220" y="467" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Insert</text>
+    <text x="220" y="495" text-anchor="middle" font-size="14" fill="#555">pyperclip + pynput</text>
+    <text x="220" y="515" text-anchor="middle" font-size="12" fill="#888">send Ctrl+V</text>
+  </g>
+  <line x1="420" y1="485" x2="340" y2="485" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="100" y="600" width="240" height="100" rx="14" fill="#0078d4"/>
+    <text x="220" y="640" text-anchor="middle" font-size="20" font-weight="700" fill="#fff">Target App</text>
+    <text x="220" y="670" text-anchor="middle" font-size="14" fill="#e7f3ff">Notepad / Browser / etc</text>
+  </g>
+  <line x1="220" y1="540" x2="220" y2="600" stroke="#1a1a1a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="420" y="600" width="240" height="100" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="540" y="640" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Tray UI</text>
+    <text x="540" y="670" text-anchor="middle" font-size="14" fill="#555">pystray</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="740" y="600" width="240" height="100" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="860" y="635" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Hotkey</text>
+    <text x="860" y="660" text-anchor="middle" font-size="14" fill="#555">pynput Ctrl+Alt+R</text>
+    <text x="860" y="680" text-anchor="middle" font-size="12" fill="#888">AHK: Caps→Ctrl+Alt+R</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1060" y="600" width="160" height="100" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="1140" y="635" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Auto-launch</text>
+    <text x="1140" y="670" text-anchor="middle" font-size="13" fill="#555">Task Scheduler</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="420" y="730" width="800" height="200" rx="14" fill="#fff" stroke="#0078d4" stroke-width="2"/>
+    <text x="820" y="772" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">Config / Logs</text>
+    <text x="820" y="810" text-anchor="middle" font-size="15" fill="#555">~/.apexvoice/config.json (hotkey, postprocess, language)</text>
+    <text x="820" y="840" text-anchor="middle" font-size="15" fill="#555">~/apexvoice_err.txt (stderr split to avoid console stall)</text>
+    <text x="820" y="870" text-anchor="middle" font-size="15" fill="#555">launch: python -u voicetype_win.py 2&gt;err.txt</text>
+    <text x="820" y="900" text-anchor="middle" font-size="15" fill="#555">schtasks /create /tn ApexVoice /sc onlogon /rl highest</text>
+  </g>
+
+  <!-- AWS side -->
+  <rect x="1280" y="180" width="460" height="780" rx="20" fill="url(#awsBg)" opacity="0.08" stroke="#ff9900" stroke-width="2"/>
+  <text x="1320" y="222" font-size="24" font-weight="700" fill="#cc7a00">AWS Cloud</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1320" y="270" width="380" height="120" rx="14" fill="#fff" stroke="#ff9900" stroke-width="2"/>
+    <text x="1510" y="312" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Amazon Bedrock</text>
+    <text x="1510" y="343" text-anchor="middle" font-size="15" fill="#555">Claude Haiku 4.5 (us-east-1)</text>
+    <text x="1510" y="365" text-anchor="middle" font-size="13" fill="#888">polish / formal / translate / bullets</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1320" y="430" width="380" height="120" rx="14" fill="#fff" stroke="#ff9900" stroke-width="2"/>
+    <text x="1510" y="472" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a1a">Auth</text>
+    <text x="1510" y="503" text-anchor="middle" font-size="15" fill="#555">aws login (CLI 2.32+)</text>
+    <text x="1510" y="525" text-anchor="middle" font-size="13" fill="#888">botocore[crt] required</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1320" y="590" width="380" height="180" rx="14" fill="#fff" stroke="#ff9900" stroke-width="2" stroke-dasharray="6,4"/>
+    <text x="1510" y="632" text-anchor="middle" font-size="20" font-weight="700" fill="#1a1a1a">AgentCore (untested)</text>
+    <text x="1510" y="665" text-anchor="middle" font-size="14" fill="#555">Memory: vocab learning</text>
+    <text x="1510" y="690" text-anchor="middle" font-size="14" fill="#555">Browser: search/summary</text>
+    <text x="1510" y="715" text-anchor="middle" font-size="14" fill="#555">Payments: x402 settlement</text>
+    <text x="1510" y="745" text-anchor="middle" font-size="12" fill="#888">shared code path with macOS</text>
+  </g>
+
+  <line x1="980" y1="485" x2="1320" y2="330" stroke="#ff9900" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
+  <text x="1140" y="395" font-size="13" fill="#cc7a00">only when post-processing</text>
+</svg>
